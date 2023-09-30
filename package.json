@@ -1,0 +1,27 @@
+{
+  "name": "node-red-contrib-vib-smart-valve",
+  "version": "0.0.1",
+  "description": "Smart Valve Managemeent",
+  "author": "Vincent Besson <vincent@besson.be>",
+  "main": "smart-valve.js",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vibr77/node-red-smart-scheduler.git"
+  },
+  "dependencies": {
+    "moment": "^2.29.4",
+    "PubSub": "^4.0.0"
+  },
+  "node-red": {
+    "nodes": {
+      "smart-valve": "smart-valve.js"
+    }
+  },
+  "keywords": [
+    "node-red"
+  ],
+  "os": [
+    "linux",
+    "darwin"
+  ]
+}
