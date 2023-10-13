@@ -9,6 +9,16 @@
             name: {value:""},
             topic:{value:""},
             tempEntity: {value:""},
+            groupId:{value:"1",required: true,validate:function(v) {
+                if (isNaN(v)){
+                    return false;
+                }
+
+                if (v<0 || v> 100){
+                    return false;
+                }
+                return true;
+            }},
             climates:{value:[{entity:"",calibration:""}],validate: function(rules, opt) {
                 return true;
             }},
@@ -16,21 +26,24 @@
             spUpdateMode:{value:"spUpdateMode.statechange.startup"},
             adjustValveTempMode:{value:"adjustValveTempMode.noAdjust"},
             adjustThreshold:{value:"0.5"},
-            allowGroupManualSp:{value:"allowGroupManualSp.yes"}
+            allowGroupManualSp:{value:"allowGroupManualSp.yes"},
+           
         },
         inputs:1,
         outputs:2,
+        outputLabels: ["HomeAssistant Service","Boiler/Scheduler"],
         icon: "font-awesome/fa-magnet",
+       
         label: function() {
             return this.name||"smart-valve";
         },
         oneditprepare: function() {
             var node = this;
 
-            $("#node-input-name").val(this.name);
-            $("#node-input-topic").val(this.topic);
-            $("#node-input-tempEntity").val(this.tempEntity);
-            $("#node-input-cycleDuration").val(this.cycleDuration);
+            //$("#node-input-name").val(this.name);
+            //$("#node-input-topic").val(this.topic);
+            //$("#node-input-tempEntity").val(this.tempEntity);
+            //$("#node-input-cycleDuration").val(this.cycleDuration);
            
             
             $("#node-input-spUpdateMode").val(node.spUpdateMode ? node.spUpdateMode : 'spUpdateMode.statechange.startup'); 
@@ -177,6 +190,10 @@
         <label for="node-input-topic"><i class="fa fa-tasks"></i> Topic</label>
         <input type="text" id="node-input-topic" placeholder="Topic"></input>
     </div>
+    <div class="form-row">
+        <label for="node-input-topic"><i class="fa fa-tasks"></i> id </label>
+        <input type="text" id="node-input-groupId" placeholder="id"></input>
+    </div>
    
     <div class="form-row">
         <label for="node-input-tempEntity"><i class="fa fa-tasks"></i> Temperature</label>
@@ -227,15 +244,29 @@
         <label style="width:120px !important;" for="node-input-adjustThreshold"><i class="fa fa-tasks"></i> Adujst threshold</label>
         <input type="text" id="node-input-adjustThreshold" style="width:60px !important; text-align: right;" placeholder="delta"></input>
         <label for="node-input-adjustThreshold"> °C</label>
-    </div>
+    </div>  
+</script>
 
- 
-          
-      </div>
+<script type="text/markdown" data-help-name="smart-valve">
+    # Smart-valve is part of a suite of node
+
+    - Smart-Scheduler: multi-zonning SmartScheduler,
+    - Smart-Valve: Valve grouping, auto-calibration, manual override,
+    - Smart-Boiler: Boiler OpenTherm, multi valve management.
+
+    ## Inputs
     
-    <div class="form-tips"><b>Tip:</b> This is here to help.</div>
-</script>
-
-<script type="text/html" data-help-name="smart-valve">
-    <p>A simple node that converts the message payloads into all lower-case characters</p>
-</script>
+    : payload (string | buffer) :  the payload of the message to publish.
+    : *topic* (string)          :  the MQTT topic to publish to.
+    
+    
+    ## Outputs
+    
+    1. Standard output
+    : payload (string) : the standard output of the command.
+    
+    2. Standard error
+    : payload (string) : the standard error of the command.
+    
+    ### Details
+    
