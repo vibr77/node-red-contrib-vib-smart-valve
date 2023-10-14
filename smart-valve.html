@@ -27,6 +27,7 @@
             adjustValveTempMode:{value:"adjustValveTempMode.noAdjust"},
             adjustThreshold:{value:"0.5"},
             allowGroupManualSp:{value:"allowGroupManualSp.yes"},
+            debugInfo:{value:false}
            
         },
         inputs:1,
@@ -244,6 +245,13 @@
         <label style="width:120px !important;" for="node-input-adjustThreshold"><i class="fa fa-tasks"></i> Adujst threshold</label>
         <input type="text" id="node-input-adjustThreshold" style="width:60px !important; text-align: right;" placeholder="delta"></input>
         <label for="node-input-adjustThreshold"> °C</label>
+    </div> 
+    <div class="form-row">
+        <label style="width:120px !important;" for="node-input-debugInfo"><i class="fa fa-tasks"></i> <b> Debug</b></label>
+    </div>
+     <div class="form-row">
+            <label style="width:120px !important;" for="node-input-debugInfo">info</label>
+     <input type="checkbox" title="send debug information to the console" id="node-input-debugInfo"  ></input>
     </div>  
 </script>
 

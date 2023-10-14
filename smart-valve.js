@@ -31,6 +31,7 @@ module.exports = function(RED) {
         this.adjustValveTempMode=n.adjustValveTempMode ? n.adjustValveTempMode : 'adjustValveTempMode.noAdjust'
         this.adjustThreshold=n.adjustThreshold ? parseFloat(n.adjustThreshold) : 0.5
         this.allowGroupManualSp=n.allowGroupManualSp ? n.allowGroupManualSp : 'allowGroupManualSp.no'
+        this.debugInfo=n.debugInfo? n.debugInfo :false; 
         this.activeSp=0;
         this.prevSp=0;
         this.requestSp=0;
@@ -43,6 +44,13 @@ module.exports = function(RED) {
         node.previousSp=0;
 
         node.manualTrigger=false;
+
+        function nlog(msg){
+        
+            if (node.debugInfo==true){
+                node.log(msg);
+            }
+        }
 
         node.on('input', function(msg) {
             msg.payload = msg.payload.toString() // Make sure we have a string.
@@ -57,7 +65,7 @@ module.exports = function(RED) {
 
                     node.manualTrigger = true;
                     node.requestSp=parseFloat(msg.sp).toFixed(2);
-                    node.log("incoming request sp:"+msg.sp);
+                    nlog("incoming request sp:"+msg.sp);
                     
                     evaluate();
                 }
@@ -77,11 +85,11 @@ module.exports = function(RED) {
             let threshold=parseFloat(node.adjustThreshold).toFixed(2);;
             
             // Check if there is an update on the valve
-            node.log("New cycle");
-            node.log("  node.manualTrigger:"+node.manualTrigger);
-            node.log("  node.firstEval:"+node.firstEval);
-            node.log("  refTemp:"+refTemp);
-            node.log("  threshold:"+threshold);
+            nlog("New cycle");
+            nlog("  node.manualTrigger:"+node.manualTrigger);
+            nlog("  node.firstEval:"+node.firstEval);
+            nlog("  refTemp:"+refTemp);
+            nlog("  threshold:"+threshold);
 
 
             node.climates.forEach((climate) => {                            // Check if Manual update occured on one of the valve
@@ -104,9 +112,9 @@ module.exports = function(RED) {
 
                 let sp=parseFloat(climateEntity.attributes.temperature).toFixed(2);
                 
-                node.log("-->"+climate.entity);
-                node.log("   Phase 1 sp:"+sp);
-                node.log("   Phase 1 node.requestSp:"+node.requestSp);
+                nlog("-->"+climate.entity);
+                nlog("   Phase 1 sp:"+sp);
+                nlog("   Phase 1 node.requestSp:"+node.requestSp);
                 
                 if(node.firstEval == true && node.manualTrigger==false){
                     // At startup node.requestSp==0; 
@@ -125,17 +133,17 @@ module.exports = function(RED) {
                         return;
                     }
 
-                    node.log("   Phase 1 manual update from the valve");
+                    nlog("   Phase 1 manual update from the valve");
                     node.valveManualSp=sp;
                     node.valveManualSpUpdate=true;
-                    node.log("   Phase 1 node.valveManualSp:"+node.valveManualSp);
+                    nlog("   Phase 1 node.valveManualSp:"+node.valveManualSp);
                 }
             });
 
 
             if(node.valveManualSpUpdate==true){             // There is a ManualUpdate directly on the valve, update all valve
                 
-                node.log("   Phase 2 node.valveManualSp:"+node.valveManualSp);
+                nlog("   Phase 2 node.valveManualSp:"+node.valveManualSp);
                 node.climates.forEach((climate) => {
 
                     if (node.allowGroupManualSp!=="allowGroupManualSp.yes"){
@@ -196,15 +204,15 @@ module.exports = function(RED) {
 
                     let sp=parseFloat(climateEntity.attributes.temperature).toFixed(2);
                 
-                    node.log("-->Phase 3:"+climate.entity);
-                    node.log("   node.firstEval:"+node.firstEval);
-                    node.log("   node.manualTrigger"+node.manualTrigger);
-                    node.log("   node.spUpdateMode:"+node.spUpdateMode);
+                    nlog("-->Phase 3:"+climate.entity);
+                    nlog("   node.firstEval:"+node.firstEval);
+                    nlog("   node.manualTrigger"+node.manualTrigger);
+                    nlog("   node.spUpdateMode:"+node.spUpdateMode);
 
                     if (node.firstEval== true || (node.manualTrigger == true && sp!=node.requestSp) || node.spUpdateMode=="spUpdateMode.cycle"){
-                        node.log("   enter condition:");
-                        node.log("     sp:"+sp);
-                        node.log("     node.requestSp:"+node.requestSp);
+                        nlog("   enter condition:");
+                        nlog("     sp:"+sp);
+                        nlog("     node.requestSp:"+node.requestSp);
                         
                         let msg={};
                         msg.payload={
@@ -221,7 +229,7 @@ module.exports = function(RED) {
                             }
                         };
                         climate.lastRequestSp=moment();             // we store last updateTS 
-                        node.log(JSON.stringify(msg));
+                        nlog(JSON.stringify(msg));
                         node.send([msg,null]);
                     }
                 });
@@ -251,16 +259,16 @@ module.exports = function(RED) {
                     id:node.groupId
                 }
 
-                node.log("output to boiler");
-                node.log(JSON.stringify(msg));
+                nlog("output to boiler");
+                nlog(JSON.stringify(msg));
 
                 node.send([null,msg]);
 
-                node.log("  update sent to the boiler");
-                node.log("  sp:"+node.requestSp);
-                node.log("  temp:"+refTemp);
-                node.log("  name:"+node.name);
-                node.log("  id:"+node.groupId);
+                nlog("  update sent to the boiler");
+                nlog("  sp:"+node.requestSp);
+                nlog("  temp:"+refTemp);
+                nlog("  name:"+node.name);
+                nlog("  id:"+node.groupId);
 
                 node.previousRefTemp=refTemp;
                 node.prevSp=node.requestSp;
@@ -283,7 +291,7 @@ module.exports = function(RED) {
                         return;
                     }
 
-                    node.log("-->Phase 5 Adjust:"+climate.entity);
+                    nlog("-->Phase 5 Adjust:"+climate.entity);
                     let climateEntity=global.get("homeassistant.homeAssistant.states['"+climate.entity+"']");
                                    
                     let currentCalibration=parseFloat(global.get("homeassistant.homeAssistant.states['"+climate.calibration+"'].state"));
@@ -304,13 +312,13 @@ module.exports = function(RED) {
                     
                     if (node.adjustValveTempMode=="adjustValveTempMode.adjust.startup" || Math.abs(delta)>threshold){
                         let newCalibration=parseFloat(currentCalibration-delta).toFixed(2);
-                        node.log("   refTemp:"+refTemp);
-                        node.log("   currentTemperature:"+currentTemperature);
-                        node.log("   currentCalibration:"+currentCalibration);
-                        node.log("   delta:"+delta);
+                        nlog("   refTemp:"+refTemp);
+                        nlog("   currentTemperature:"+currentTemperature);
+                        nlog("   currentCalibration:"+currentCalibration);
+                        nlog("   delta:"+delta);
                         
-                        node.log("   newCalibration:"+newCalibration);
-                        node.log("   threshold:"+node.adjustThreshold);
+                        nlog("   newCalibration:"+newCalibration);
+                        nlog("   threshold:"+node.adjustThreshold);
                         let msg={}
                         msg.payload={
                             topic: node.topic,
