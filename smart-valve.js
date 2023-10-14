@@ -81,7 +81,11 @@ module.exports = function(RED) {
             }*/
             
             let tempEntity=global.get("homeassistant.homeAssistant.states['"+node.tempEntity+"']");
-            let refTemp=parseFloat(tempEntity.state).toFixed(2);;
+            if (tempEntity===undefined){
+                nlog("tempEntity is undefined returning");
+                return;
+            }
+            let refTemp=parseFloat(tempEntity.state).toFixed(2);
             let threshold=parseFloat(node.adjustThreshold).toFixed(2);;
             
             // Check if there is an update on the valve
