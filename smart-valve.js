@@ -1,7 +1,7 @@
 
 /*
 __   _____ ___ ___        Author: Vincent BESSON
- \ \ / /_ _| _ ) _ \      Release: 0.6
+ \ \ / /_ _| _ ) _ \      Release: 0.62
   \ V / | || _ \   /      Date: 20230930
    \_/ |___|___/_|_\      Description: Nodered Heating Valve Management
                 2023      Licence: Creative Commons
@@ -68,9 +68,9 @@ module.exports = function(RED) {
 
         function evaluate() {
             
-            var msg = {
+            /*var msg = {
                 topic: node.topic,
-            }
+            }*/
             
             let tempEntity=global.get("homeassistant.homeAssistant.states['"+node.tempEntity+"']");
             let refTemp=parseFloat(tempEntity.state).toFixed(2);;
@@ -142,8 +142,9 @@ module.exports = function(RED) {
                         node.warn("  Phase 2 node.allowGroupManualSp=NO skipping group update");
                         return;
                     }
-                    
+                    let msg={};
                     msg.payload={
+                        topic: node.topic,
                         domain:"climate",
                         service:"set_temperature",
                         target:{
@@ -160,8 +161,7 @@ module.exports = function(RED) {
 
                 node.valveManualSpUpdate=false;
                 node.requestSp=node.valveManualSp;
-                
-                msg={
+                let msg={
                     topic:node.topic,
                     payload:"override",
                     sp:node.valveManualSp,
@@ -196,7 +196,7 @@ module.exports = function(RED) {
 
                     let sp=parseFloat(climateEntity.attributes.temperature).toFixed(2);
                 
-                    node.log("-->"+climate.entity);
+                    node.log("-->Phase 3:"+climate.entity);
                     node.log("   node.firstEval:"+node.firstEval);
                     node.log("   node.manualTrigger"+node.manualTrigger);
                     node.log("   node.spUpdateMode:"+node.spUpdateMode);
@@ -206,7 +206,9 @@ module.exports = function(RED) {
                         node.log("     sp:"+sp);
                         node.log("     node.requestSp:"+node.requestSp);
                         
+                        let msg={};
                         msg.payload={
+                            topic: node.topic,
                             domain:"climate",
                             service:"set_temperature",
                             target:{
@@ -219,7 +221,7 @@ module.exports = function(RED) {
                             }
                         };
                         climate.lastRequestSp=moment();             // we store last updateTS 
-                        
+                        node.log(JSON.stringify(msg));
                         node.send([msg,null]);
                     }
                 });
@@ -242,6 +244,7 @@ module.exports = function(RED) {
                 // Something have changed or firstEval output
                 let msg={};
                 msg.payload={
+                    topic: node.topic,
                     sp:node.requestSp,
                     temp:refTemp,
                     name:node.name,
@@ -308,8 +311,9 @@ module.exports = function(RED) {
                         
                         node.log("   newCalibration:"+newCalibration);
                         node.log("   threshold:"+node.adjustThreshold);
-                        
+                        let msg={}
                         msg.payload={
+                            topic: node.topic,
                             domain:"number",
                             service:"set_value",
                             target:{
