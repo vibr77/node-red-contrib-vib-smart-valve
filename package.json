@@ -1,8 +1,10 @@
 {
   "name": "node-red-contrib-vib-smart-valve",
-  "version": "0.0.66",
+  "version": "0.0.70",
   "description": "Smart Valve Managemeent",
   "author": "Vincent Besson <vincent@besson.be>",
+  "license" : "CC-BY-2.5",
+  
   "main": "smart-valve.js",
   "repository": {
     "type": "git",
@@ -14,10 +16,17 @@
   "node-red": {
     "nodes": {
       "smart-valve": "smart-valve.js"
-    }
+    },
+    "version": ">=2.0.0"
   },
   "keywords": [
-    "node-red"
+    "node-red","Heating","valve","trv","climate"
+  ],
+  "funding": [
+    {
+      "type" : "buymeacoffee",
+      "url" : "https://www.buymeacoffee.com/vincentbe"
+    }
   ],
   "os": [
     "linux",
