@@ -1,14 +1,13 @@
 <script type="text/javascript">
     // Terminal command  node-red -v -D logging.console.level=trace
 
-
     RED.nodes.registerType('smart-valve',{
         category: 'vib-node',
         color: '#bdeeff',
         defaults: {
             name: {value:""},
             topic:{value:""},
-            tempEntity: {value:""},
+            tempEntity: {value:"",required: true},
             groupId:{value:"1",required: true,validate:function(v) {
                 if (isNaN(v)){
                     return false;
@@ -25,9 +24,18 @@
             cycleDuration: {value:"5"},
             spUpdateMode:{value:"spUpdateMode.statechange.startup"},
             adjustValveTempMode:{value:"adjustValveTempMode.noAdjust"},
-            adjustThreshold:{value:"0.5"},
-            allowGroupManualSp:{value:"allowGroupManualSp.yes"},
-            debugInfo:{value:false}
+            adjustThreshold:{value:1,required:true,validate:function(v){
+                if (isNaN(v)){
+                    return false;
+                }
+
+                if (v<0 || v> 9){
+                    return false;
+                }
+                return true;
+            }},
+            debugInfo:{value:false},
+            allowOverride:{value:false},
            
         },
         inputs:1,
@@ -40,18 +48,10 @@
         },
         oneditprepare: function() {
             var node = this;
-
-            //$("#node-input-name").val(this.name);
-            //$("#node-input-topic").val(this.topic);
-            //$("#node-input-tempEntity").val(this.tempEntity);
-            //$("#node-input-cycleDuration").val(this.cycleDuration);
-           
-            
+            /*
             $("#node-input-spUpdateMode").val(node.spUpdateMode ? node.spUpdateMode : 'spUpdateMode.statechange.startup'); 
             $("#node-input-adjustValveTempMode").val(node.adjustValveTempMode ? node.adjustValveTempMode : 'adjustValveTempMode.noAdjust'); 
-            $("#node-input-allowGroupManualSp").val(node.allowGroupManualSp ? node.allowGroupManualSp : 'allowGroupManualSp.no'); 
             
-
             $("#node-input-adjustThreshold").val(this.adjustThreshold);
             
             $("#node-input-name").keyup(function (event) {
@@ -69,7 +69,7 @@
             $("#node-input-cycleDuration").keyup(function (event) {
                 this.cycleDuration=$('#node-input-cycleDuration').val();
             })            
-
+            */
             if (!this.climates) {
                 var climate = {
                     entity:"",
@@ -85,7 +85,6 @@
                 addItem: function(container,i,opt) {
                     var climate = opt;
                     
-
                     if ( typeof node.climates[i] === 'undefined'){
                         node.climates[i]={};
                     }
@@ -99,14 +98,9 @@
                     
                     var row1 = $('<div/>',{style:"display:flex; align-items: baseline"}).appendTo(fragment);
                     var row2 = $('<div/>',{style:"margin-top:8px;"}).appendTo(fragment);
-                   
-                   // $('<label style="width:20px !important; text-align: right;" ><span><i class="fa fa-share-alt"></i></span></label>').appendTo(row1);
-                   // $('<label style="width:20px !important;" ><span><b>'+(i+1)+' Climate</b></span></label>').appendTo(row1);
-                   //$('<label  style="text-align: left;"><span><i class="fa fa-share-alt"></i>/span></label>').appendTo(row1);
-                    $('<label  style="width:20px !important; text-align: left;"><span><i class="fa fa-share-alt"/><b>'+(i+1)+'</b></span></label>').appendTo(row1);
                 
+                    $('<label  style="width:20px !important; text-align: left;"><span><i class="fa fa-share-alt"/><b>'+(i+1)+'</b></span></label>').appendTo(row1);
                     $('<label  style="text-align: right; margin-right:5px;"><span>Climate:</span></label>').appendTo(row1);
-                   
                     $('<input type="text" id="node-input-climateEntity_'+i+'" idx="'+i+'" class="node-input-climateEntity" placeholder="Climate entity" >').appendTo(row1);
                     
                     var row2_1 = $('<div/>', {style:"display:flex;align-items: baseline"}).appendTo(row2);
@@ -128,20 +122,17 @@
                         ctrl_i=$(event.target).attr('idx');
                         node.climates[ctrl_i].calibration=$('#node-input-calibrationEntity_'+ctrl_i).val();
                     });
-
-
                 },
                 removeItem:function(data) {
-                    console.log("remove");
-                   
-                    console.log(data);
+                    //console.log("remove");
+                    //console.log(data);
                 },
                 resizeItem: function(row,index) {
                     var originalData = $(row).data('data');
                     console.log("Resize the row for item:", originalData)
                 },
                 resize: function() {
-                    console.log("I have changed in size")
+                    //console.log("I have changed in size")
                 }
             });
 
@@ -152,11 +143,11 @@
         },
         oneditsave: function() {
             var node = this;
-            node.outputs=2;
-            node.inputs=1;
-            node.spUpdateMode=$("#node-input-spUpdateMode").find(":selected").val();
-            node.adjustValveTempMode=$("#node-input-adjustValveTempMode").find(":selected").val();
-            node.allowGroupManualSp=$("#node-input-allowGroupManualSp").find(":selected").val();
+            //node.outputs=2;
+            //node.inputs=1;
+            //node.spUpdateMode=$("#node-input-spUpdateMode").find(":selected").val();
+            //node.adjustValveTempMode=$("#node-input-adjustValveTempMode").find(":selected").val();
+            //node.allowGroupManualSp=$("#node-input-allowGroupManualSp").find(":selected").val();
             var climates = $("#node-input-climate-container").editableList('items');
             node.climates= [];
 
@@ -171,6 +162,7 @@
             });
         },
         oneditresize: function() {
+
         }
     });
 
@@ -192,7 +184,7 @@
         <input type="text" id="node-input-topic" placeholder="Topic"></input>
     </div>
     <div class="form-row">
-        <label for="node-input-topic"><i class="fa fa-tasks"></i> id </label>
+        <label for="node-input-topic"><i class="fa fa-tasks"></i> Group id </label>
         <input type="text" id="node-input-groupId" placeholder="id"></input>
     </div>
    
@@ -204,55 +196,43 @@
     <div class="form-row node-input-climate-container-row">
         <ol id="node-input-climate-container"></ol>
     </div>
-
     <div class="form-row">
-        <label style="width:120px !important;" for="node-input-cycleDuration"><i class="fa fa-tasks"></i> Update cycle</label>
-        <input type="text" id="node-input-cycleDuration" style="width:60px !important; text-align: right;" placeholder="duration"></input>
-        <label for="node-input-cycleDuration2"></i> min</label>
-    </div>
-    
-    <div class="form-row">      
-        <p style="padding-top: 10px"><i class="fa fa-info-circle"></i> Note: Marked schedule = "On Payload"</p>
-    </div>    
-    
-    <div class="form-row">
-        <label style="width:120px !important;" for="node-input-spUpdateMode"><i class="fa fa-play"></i> SP update mode </label>
+        <label style="width:120px !important;" for="node-input-spUpdateMode"><i class="fa fa-play"></i> Update mode </label>
         <select id="node-input-spUpdateMode">
             <option value="spUpdateMode.statechange">when state changes</option>
             <option value="spUpdateMode.statechange.startup">when state changes + startup</option>
             <option value="spUpdateMode.cycle">every cycle</option>
         </select>
     </div>
-
     <div class="form-row">
-        <label style="width:120px !important;" for="node-input-allowGroupManualSp"><i class="fa fa-play"></i> Group manual SP</label>
-        <select id="node-input-allowGroupManualSp">
-            <option value="allowGroupManualSp.no">No</option>
-            <option value="allowGroupManualSp.yes">Yes</option>
-        </select>
+        <label style="width:120px !important;" for="node-input-cycleDuration"><i class="fa fa-tasks"></i> Update cycle</label>
+        <input type="text" id="node-input-cycleDuration" style="width:60px !important; text-align: right;" placeholder="duration"></input> 
     </div>
-
+    <div class="form-row">      
+        <p style="padding-top: 10px"><i class="fa fa-chain-broken"></i> Allow manual</p> 
+        <input type="checkbox" title="allow override mode" id="node-input-allowOverride"  ></input>
+        <label for="node-input-cycleDuration2"></i> update</label>
+    </div>
+    
     <div class="form-row">
-        <label style="width:120px !important;" for="node-input-adjustValveTempMode"><i class="fa fa-play"></i> Adjust valve temp</label>
+        <label style="width:120px !important;" for="node-input-adjustValveTempMode"><i class="fa fa-play"></i> Recalibration</label>
         <select id="node-input-adjustValveTempMode">
             <option value="adjustValveTempMode.noAdjust">No</option>
             <option value="adjustValveTempMode.adjust.startup">Yes</option>
             <option value="adjustValveTempMode.adjust.threshold">Yes with threshold</option>
         </select>
     </div>
-
     <div class="form-row">
-        <label style="width:120px !important;" for="node-input-adjustThreshold"><i class="fa fa-tasks"></i> Adujst threshold</label>
+        <label style="width:120px !important;" for="node-input-adjustThreshold"><i class="fa fa-tasks"></i> delta threshold</label>
         <input type="text" id="node-input-adjustThreshold" style="width:60px !important; text-align: right;" placeholder="delta"></input>
         <label for="node-input-adjustThreshold"> °C</label>
     </div> 
     <div class="form-row">
-        <label style="width:120px !important;" for="node-input-debugInfo"><i class="fa fa-tasks"></i> <b> Debug</b></label>
+        <label style="width:120px !important;" for="node-input-debugInfo"><i class="fa fa-tasks"></i> Debug</label>
+        <input type="checkbox" title="send debug information to the console" id="node-input-debugInfo"  ></input>
+        <label style="width:120px !important;" for="node-input-debugInfo">info</label>
     </div>
-     <div class="form-row">
-            <label style="width:120px !important;" for="node-input-debugInfo">info</label>
-     <input type="checkbox" title="send debug information to the console" id="node-input-debugInfo"  ></input>
-    </div>  
+
 </script>
 
 <script type="text/markdown" data-help-name="smart-valve">
@@ -262,19 +242,51 @@
     - Smart-Valve: Valve grouping, auto-calibration, manual override,
     - Smart-Boiler: Boiler OpenTherm, multi valve management.
 
-    ## Inputs
+    ## Smart-valve
+
+    This node enables to manage multiple valve (climate) in a same room like one. 
+    It support the following features :
+    - External temperature sensor,
+    - Multiple valves updates,
+    - TRV temperture Recalibration based on the external temperature sensor,
+    - Manual update directly on the valve to trigger override message to the scheduler and update the other valve
+
+    ### Inputs
     
-    : payload (string | buffer) :  the payload of the message to publish.
-    : *topic* (string)          :  the MQTT topic to publish to.
-    
+    : payload (string):[1|on|trigger]
+    : sp (integer): [0-35]    
     
     ## Outputs
     
-    1. Standard output
-    : payload (string) : the standard output of the command.
+    1. Update home assistant via call service
     
-    2. Standard error
-    : payload (string) : the standard error of the command.
+    2. Update of SP to the boiler (smart-Boiler) or override message to the smart-scheduler
     
-    ### Details
+    ### Settings
+
+    - Name: [string], name of the node and also the name of the group sent to the smart-boiler node
+    - Topic: [string], not used,
+    - Group Id: [integer], used by the smart-boiler node to identify this group of valves, need to be unique
+    
+    - Temperature: [string], is the name of the external temperature sensor entity in home assistant ex: sensor.temp9
+    - Update mode: [state changed|state changed+startup|every cycle], define how frequently updates are sent to the smart-boiler node
+    - Update cycle: [integer], duration in minute between two cycle. default is 5
+    - Allow manual updates: [true|false], enable direct set point (target temperature) change on the valve or home assistant. If true when a valve set point is changed all the other valves are updated and a override message is sent to the smart-scheduler node.
+    - Recalibration: [No|Yes|Yes+threshold], enable to adjust the valve (TRV) current temperature based on the external temperature sensor,
+    - Delta threshold: [integer] [0-9], threshold delta between external temperature sensor and the TRV current temperature to trigger recalibration,
+    - Debug: [true|false], send debug info to the node-red console
+    - Climate: each valve entry has 2 field:
+        - climate: [string], home assitant climate entity of the valve ex: climate.kitchen
+        - calibration: [string], home assistant calibration entity of the valve ex: number.kitchen_calibration
+    
+    ### Execution rules 
+
+    - Step 0: update current group setpoint with the sp of the valve,
+    - Cycle :
+        Step 1: identify if manual updates on valve, then update all valves,
+        Step 2: check and execute recalibration
+        Step 3: based on the execution mode, output to the smart-boiler node
+    - On input: 
+        Update the requested set-point on each valves
+
     

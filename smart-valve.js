@@ -20,19 +20,19 @@ module.exports = function(RED) {
         this.name = n.name
         this.settings = RED.nodes.getNode(n.settings) // Get global settings
         var global = this.context().global;
-        var node = this
-        this.topic = n.topic;
-        this.groupId=n.groupId;
-        this.climates = n.climates;
-        this.tempEntity=n.tempEntity ? n.tempEntity : '';
         
-        this.cycleDuration=n.cycleDuration ? parseInt(n.cycleDuration): 5;
-        this.spUpdateMode=n.spUpdateMode ? n.spUpdateMode : 'spUpdateMode.statechange.startup';
-        this.adjustValveTempMode=n.adjustValveTempMode ? n.adjustValveTempMode : 'adjustValveTempMode.noAdjust'
-        this.adjustThreshold=n.adjustThreshold ? parseFloat(n.adjustThreshold) : 0.5
-        this.allowGroupManualSp=n.allowGroupManualSp ? n.allowGroupManualSp : 'allowGroupManualSp.no'
-        this.debugInfo=n.debugInfo? n.debugInfo :false; 
-        this.activeSp=0;
+        this.topic = n.topic;
+        this.groupId=n.groupId;                                                                         // GroupId <!> Important for the SmartBoiler, interger unique
+        this.climates = n.climates;                                                                     // Array of climate entities to be manages
+        this.tempEntity=n.tempEntity ? n.tempEntity : '';                                               // Reference Temperture entity
+        
+        this.cycleDuration=n.cycleDuration ? parseInt(n.cycleDuration): 5;                              // duration cycle in min
+        this.spUpdateMode=n.spUpdateMode ? n.spUpdateMode : 'spUpdateMode.statechange.startup';         // Execution mode [statechange|+startup|every cycle]
+        this.adjustValveTempMode=n.adjustValveTempMode ? n.adjustValveTempMode : 'adjustValveTempMode.noAdjust';
+        this.adjustThreshold=n.adjustThreshold ? parseFloat(n.adjustThreshold) : 1;
+        this.debugInfo=n.debugInfo? n.debugInfo :false;                                                 // debug verbose to the console
+        this.allowOverride=n.allowOverride ? n.allowOverride :false;                                    // Allow Manual update from the valve // climate
+        
         this.prevSp=0;
         this.requestSp=0;
         this.firstEval = true;
@@ -40,13 +40,14 @@ module.exports = function(RED) {
         this.valveManualSp=0;
         this.startTs=0;
 
+        var node = this;
+
         node.previousRefTemp=0;
         node.previousSp=0;
 
         node.manualTrigger=false;
 
         function nlog(msg){
-        
             if (node.debugInfo==true){
                 node.log(msg);
             }
@@ -54,7 +55,7 @@ module.exports = function(RED) {
 
         node.on('input', function(msg) {
             msg.payload = msg.payload.toString() // Make sure we have a string.
-            if (msg.payload.match(/^(1|on|0|off|auto|override|trigger)$/i)) {
+            if (msg.payload.match(/^(1|on|0|off|trigger)$/i)) {
                 
                 if (msg.payload == '1' || msg.payload == 'trigger' || msg.payload == 'on'){
                     
@@ -70,15 +71,10 @@ module.exports = function(RED) {
                     evaluate();
                 }
 
-                
             } else node.warn('Failed to interpret incoming msg.payload. Ignoring it!')
         });
 
         function evaluate() {
-            
-            /*var msg = {
-                topic: node.topic,
-            }*/
             
             let tempEntity=global.get("homeassistant.homeAssistant.states['"+node.tempEntity+"']");
             if (tempEntity===undefined){
@@ -94,7 +90,7 @@ module.exports = function(RED) {
             nlog("  node.firstEval:"+node.firstEval);
             nlog("  refTemp:"+refTemp);
             nlog("  threshold:"+threshold);
-
+            nlog("  allowOverride:"+node.allowOverride);
 
             node.climates.forEach((climate) => {                            // Check if Manual update occured on one of the valve
 
@@ -109,11 +105,6 @@ module.exports = function(RED) {
                     return;
                 }
 
-                if (node.allowGroupManualSp!=="allowGroupManualSp.yes"){                                // <----------- To be reworked
-                    node.warn("  Phase 2 node.allowGroupManualSp=NO skipping group update");
-                    return;
-                }
-
                 let sp=parseFloat(climateEntity.attributes.temperature).toFixed(2);
                 
                 nlog("-->"+climate.entity);
@@ -125,15 +116,15 @@ module.exports = function(RED) {
                     // we should assign the existing sp to node.requestSP
                     // If Smart-scheduler is wire as input node.manualTriger will be true
 
-                    node.log("  Phase 1 first Eval node.reqestSp=sp");
+                    nlog("  Phase 1 first Eval node.reqestSp=sp");
                     node.requestSp=sp;
-                }else if (node.manualTrigger == false && sp!=node.requestSp && node.firstEval == false){
+                }else if (node.manualTrigger == false && sp!=node.requestSp && node.firstEval == false && node.allowOverride==true){
                     
                     let now = moment();                                             // <-------- 60 s is needed for Home assistant to update
                     let diff=now.diff(node.startTs)/1000;
-                    node.log("   Phase 1 diff startTs:"+diff);
+                    nlog("   Phase 1 diff startTs:"+diff);
                     if (diff<60){
-                        node.log("   Phase 1 node.startTs < 60s returning");
+                        nlog("   Phase 1 node.startTs < 60s returning");
                         return;
                     }
 
@@ -145,15 +136,11 @@ module.exports = function(RED) {
             });
 
 
-            if(node.valveManualSpUpdate==true){             // There is a ManualUpdate directly on the valve, update all valve
+            if(node.valveManualSpUpdate==true && node.allowOverride==true){             // There is a ManualUpdate directly on the valve, update all valve
                 
                 nlog("   Phase 2 node.valveManualSp:"+node.valveManualSp);
                 node.climates.forEach((climate) => {
 
-                    if (node.allowGroupManualSp!=="allowGroupManualSp.yes"){
-                        node.warn("  Phase 2 node.allowGroupManualSp=NO skipping group update");
-                        return;
-                    }
                     let msg={};
                     msg.payload={
                         topic: node.topic,
@@ -181,9 +168,7 @@ module.exports = function(RED) {
                 }
         
                 node.send([null,msg]);
-                
-                msg = {topic: node.topic}
-
+            
                 node.status({
                     fill:  'yellow',
                     shape: 'dot',
@@ -250,7 +235,7 @@ module.exports = function(RED) {
 
 
             // If Ref Temp or SP have changed send output update:
-            node.log("-->Phase 4 - Boiler update");
+            nlog("-->Phase 4 - Boiler update");
             if (refTemp!=node.previousRefTemp || node.requestSp!=node.previousSp || node.firstEval==true){
 
                 // Something have changed or firstEval output
@@ -278,10 +263,10 @@ module.exports = function(RED) {
                 node.prevSp=node.requestSp;
 
             }else{
-                node.log("  no update");
+                nlog("  no update");
             }
 
-            if (node.adjustValveTempMode!="adjustValveTempMode.noAdjust"){
+            if (node.adjustValveTempMode!="adjustValveTempMode.noAdjust"){     // <--- Add the threshold management
 
                 node.climates.forEach((climate) => {
 
@@ -302,7 +287,8 @@ module.exports = function(RED) {
                     
                     if (isNaN(currentCalibration)){
                         node.warn("   Phase 5 isNaN(currentCalibration)");
-                        return;
+                        nlog("set calibration:0");
+                        currentCalibration=0;
                     }
 
                     let currentTemperature=parseFloat(climateEntity.attributes.current_temperature);
@@ -350,7 +336,7 @@ module.exports = function(RED) {
 
         // Run initially directly after start / deploy.
         if (node.triggerMode != 'triggerMode.statechange') {
-            setTimeout(evaluate, 20000)
+            setTimeout(evaluate, 1000)
         }
 
         node.on('close', function() {
