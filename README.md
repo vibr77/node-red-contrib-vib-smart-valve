@@ -19,8 +19,8 @@
 
     ### Inputs
     
-    : payload (string):[1|on|trigger]
-    : sp (integer): [0-35]    
+    - payload (string):[1|on|trigger]
+    - sp (integer): [0-35]    
     
     ## Outputs
     

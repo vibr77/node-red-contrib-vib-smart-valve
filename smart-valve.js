@@ -1,7 +1,7 @@
 
 /*
 __   _____ ___ ___        Author: Vincent BESSON
- \ \ / /_ _| _ ) _ \      Release: 0.62
+ \ \ / /_ _| _ ) _ \      Release: 0.72
   \ V / | || _ \   /      Date: 20230930
    \_/ |___|___/_|_\      Description: Nodered Heating Valve Management
                 2023      Licence: Creative Commons
@@ -198,7 +198,7 @@ module.exports = function(RED) {
                     text:("Manual override sp: "+node.valveManualSp+"°C, temp: "+refTemp+"°C")
                 });   
                 
-            }else{                  // No Manual Update we can proceed to check if 
+            }else{  // No Manual Update we can proceed to check if 
 
                 node.climates.forEach((climate) => {
                 
@@ -245,14 +245,21 @@ module.exports = function(RED) {
                         node.send([msg,null]);
                     }
                 });
-                
-                node.status({
-                    fill:  'blue',
-                    shape: 'dot',
-                    text:("temp: "+refTemp+"°C, sp: "+node.requestSp+"°C")
-                });
-
-                
+                // Update the status in UI
+                if (parseFloat(refTemp)>parseFloat(node.requestSp)){
+                    node.status({
+                        fill:  'green',
+                        shape: 'dot',
+                        text:("temp: "+refTemp+"°C, sp: "+node.requestSp+"°C")
+                    });
+                }else{
+                    node.status({
+                        fill:  'red',
+                        shape: 'dot',
+                        text:("temp: "+refTemp+"°C, sp: "+node.requestSp+"°C")
+                    });
+                }
+        
                 node.manualTrigger = false;
             }
 
