@@ -32,7 +32,8 @@ module.exports = function(RED) {
         this.adjustThreshold=n.adjustThreshold ? parseFloat(n.adjustThreshold) : 1;
         this.debugInfo=n.debugInfo? n.debugInfo :false;                                                 // debug verbose to the console
         this.allowOverride=n.allowOverride ? n.allowOverride :false;                                    // Allow Manual update from the valve // climate
-        
+        this.executionMode=true;
+
         this.prevSp=0;
         this.requestSp=0;
         this.firstEval = true;
@@ -53,22 +54,35 @@ module.exports = function(RED) {
             }
         }
 
+        this.ev=function(){
+            node.manualTrigger=true;
+            evaluate();
+        }
+
         node.on('input', function(msg) {
-            msg.payload = msg.payload.toString() // Make sure we have a string.
-            if (msg.payload.match(/^(1|on|0|off|trigger)$/i)) {
+            if (msg===undefined || msg.payload===undefined){
+                node.warn("invaid input returning");
+                return;
+            }
+
+            let command=msg.payload.command;
+            if (command !==undefined && command.match(/^(1|set|on|0|off|trigger)$/i)) {
                 
-                if (msg.payload == '1' || msg.payload == 'trigger' || msg.payload == 'on'){
+                if (command == '1' || command== 'trigger' || command == 'on' || command == 'set'){
                     
-                    if (msg.sp=== undefined || isNaN(msg.sp) || parseFloat(msg.sp)<0 || parseFloat(msg.sp)>35){ //<----------- Todo define Max & Min in config
+                    if (msg.payload.setpoint=== undefined || isNaN(msg.payload.setpoint) || parseFloat(msg.payload.setpoint)<0 || parseFloat(msg.payload.setpoint)>35){ //<----------- Todo define Max & Min in config
                         node.warn('received trigger missing or invalid msg.sp number');
                         return;
                     }
 
                     node.manualTrigger = true;
-                    node.requestSp=parseFloat(msg.sp).toFixed(2);
-                    nlog("incoming request sp:"+msg.sp);
-                    
+                    node.requestSp=parseFloat(msg.payload.setpoint).toFixed(2);
+                    nlog("incoming request sp:"+node.requestSp);
+                    node.executionMode=true;
                     evaluate();
+                }else if(command=="0"|| command=='off'){
+                    nlog("set smart-valve off")
+                    node.executionMode=false;
                 }
 
             } else node.warn('Failed to interpret incoming msg.payload. Ignoring it!')
@@ -76,11 +90,17 @@ module.exports = function(RED) {
 
         function evaluate() {
             
+            if (node.executionMode==false){
+                nlog("smart-valve is off returning");
+                return;
+            }
+
             let tempEntity=global.get("homeassistant.homeAssistant.states['"+node.tempEntity+"']");
             if (tempEntity===undefined){
                 nlog("tempEntity is undefined returning");
                 return;
             }
+
             let refTemp=parseFloat(tempEntity.state).toFixed(2);
             let threshold=parseFloat(node.adjustThreshold).toFixed(2);;
             
@@ -160,11 +180,14 @@ module.exports = function(RED) {
 
                 node.valveManualSpUpdate=false;
                 node.requestSp=node.valveManualSp;
+                
                 let msg={
                     topic:node.topic,
-                    payload:"override",
-                    sp:node.valveManualSp,
-                    noout:true
+                    payload:{
+                        command:"override",
+                        setpoint:node.valveManualSp,
+                        noout:true
+                    }
                 }
         
                 node.send([null,msg]);
@@ -242,8 +265,8 @@ module.exports = function(RED) {
                 let msg={};
                 msg.payload={
                     topic: node.topic,
-                    sp:node.requestSp,
-                    temp:refTemp,
+                    setpoint:node.requestSp,
+                    temperature:refTemp,
                     name:node.name,
                     id:node.groupId
                 }
@@ -345,4 +368,21 @@ module.exports = function(RED) {
 
     }
     RED.nodes.registerType('smart-valve', SmartValve)
+
+    RED.httpAdmin.post("/smartvalve/:id", RED.auth.needsPermission("inject.write"), function(req,res) {
+        var node = RED.nodes.getNode(req.params.id);
+        if (node != null) {
+            try {
+               
+                node.ev();
+                
+                res.sendStatus(200);
+            } catch(err) {
+                res.sendStatus(500);
+                node.error(RED._("inject.failed",{error:err.toString()}));
+            }
+        } else {
+            res.sendStatus(404);
+        }
+    });
 }

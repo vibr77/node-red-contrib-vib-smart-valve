@@ -42,7 +42,32 @@
         outputs:2,
         outputLabels: ["HomeAssistant Service","Boiler/Scheduler"],
         icon: "font-awesome/fa-magnet",
-       
+        button: {
+            
+            onclick: function() {
+                let node=this;
+                $.ajax({
+                    url: "smartvalve/" + node.id,
+                    type: "POST",
+                    data: JSON.stringify({payload:{command:"trigger"}}),
+                    contentType: "application/json; charset=utf-8",
+                    success: function (resp) {
+                        RED.notify(node._("smart-valve trigger sucess", { label: "ss" }), { type: "success", id: "inject", timeout: 2000 });
+                    },
+                    error: function (jqXHR, textStatus, errorThrown) {
+                        if (jqXHR.status == 404) {
+                            RED.notify(node._("common.notification.error", { message: node._("common.notification.errors.not-deployed") }), "error");
+                        } else if (jqXHR.status == 500) {
+                            RED.notify(node._("common.notification.error", { message: node._("inject.errors.failed") }), "error");
+                        } else if (jqXHR.status == 0) {
+                            RED.notify(node._("common.notification.error", { message: node._("common.notification.errors.no-response") }), "error");
+                        } else {
+                            RED.notify(node._("common.notification.error", { message: node._("common.notification.errors.unexpected", { status: jqXHR.status, message: textStatus }) }), "error");
+                        }
+                    }
+                });
+            }
+        },
         label: function() {
             return this.name||"smart-valve";
         },
