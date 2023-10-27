@@ -214,7 +214,7 @@ module.exports = function(RED) {
                         return;
                     }
 
-                    let sp=parseFloat(climateEntity.attributes.temperature).toFixed(2);
+                    let sp=parseFloat(climateEntity.attributes.temperature);
                 
                     nlog("-->Phase 3:"+climate.entity);
                     nlog("   node.firstEval:"+node.firstEval);
@@ -246,17 +246,17 @@ module.exports = function(RED) {
                     }
                 });
                 // Update the status in UI
-                if (parseFloat(refTemp)>parseFloat(node.requestSp)){
+                if (Math.round(parseFloat(refTemp))>parseFloat(node.requestSp)){
                     node.status({
                         fill:  'green',
                         shape: 'dot',
-                        text:("temp: "+refTemp+"°C, sp: "+node.requestSp+"°C")
+                        text:("temp: "+Math.round(refTemp)+"°C, sp: "+node.requestSp+"°C")
                     });
                 }else{
                     node.status({
                         fill:  'red',
                         shape: 'dot',
-                        text:("temp: "+refTemp+"°C, sp: "+node.requestSp+"°C")
+                        text:("temp: "+Math.round(refTemp)+"°C, sp: "+node.requestSp+"°C")
                     });
                 }
         
@@ -271,11 +271,12 @@ module.exports = function(RED) {
                 // Something have changed or firstEval output
                 let msg={};
                 msg.payload={
+                    command:"set",
                     topic: node.topic,
                     setpoint:node.requestSp,
                     temperature:refTemp,
                     name:node.name,
-                    id:node.groupId
+                    groupid:node.groupId
                 }
 
                 nlog("output to boiler");
