@@ -33,6 +33,7 @@ module.exports = function(RED) {
         this.debugInfo=n.debugInfo? n.debugInfo :false;                                                 // debug verbose to the console
         this.allowOverride=n.allowOverride ? n.allowOverride :false;                                    // Allow Manual update from the valve // climate
         this.executionMode=true;
+        this.offSp=n.offSp ? n.offSp: 5;
 
         this.prevSp=0;
         this.requestSp=0;
@@ -61,7 +62,7 @@ module.exports = function(RED) {
 
         node.on('input', function(msg) {
             if (msg===undefined || msg.payload===undefined){
-                node.warn("invaid input returning");
+                node.warn("invalid input returning");
                 return;
             }
 
@@ -70,6 +71,18 @@ module.exports = function(RED) {
                 
                 if (command == '1' || command== 'trigger' || command == 'on' || command == 'set'){
                     
+                    if (command=='on'){
+                        node.executionMode=true;
+                        evaluate();
+                        return;
+                    }
+
+                    if (node.executionMode==false){
+                        evaluate();
+                        return;
+                    }
+                        
+
                     if (msg.payload.setpoint=== undefined || isNaN(msg.payload.setpoint) || parseFloat(msg.payload.setpoint)<0 || parseFloat(msg.payload.setpoint)>35){ //<----------- Todo define Max & Min in config
                         node.warn('received trigger missing or invalid msg.sp number');
                         return;
@@ -83,6 +96,7 @@ module.exports = function(RED) {
                 }else if(command=="0"|| command=='off'){
                     nlog("set smart-valve off")
                     node.executionMode=false;
+                    evaluate();
                 }
 
             } else node.warn('Failed to interpret incoming msg.payload. Ignoring it!')
@@ -90,11 +104,6 @@ module.exports = function(RED) {
 
         function evaluate() {
             
-            if (node.executionMode==false){
-                nlog("smart-valve is off returning");
-                return;
-            }
-
             let tempEntity=global.get("homeassistant.homeAssistant.states['"+node.tempEntity+"']");
             if (tempEntity===undefined){
                 nlog("tempEntity is undefined returning");
@@ -103,6 +112,55 @@ module.exports = function(RED) {
 
             let refTemp=parseFloat(tempEntity.state).toFixed(2);
             let threshold=parseFloat(node.adjustThreshold).toFixed(2);;
+            
+
+            if (node.executionMode==false){                             // <--- Put default temperature mode
+                nlog("smart-valve is off returning");
+                node.climates.forEach((climate) => {
+
+                    let msg={};
+                    msg.payload={
+                        topic: node.topic,
+                        domain:"climate",
+                        service:"set_temperature",
+                        target:{
+                            entity_id:[
+                                climate.entity
+                            ]
+                        },
+                        data:{
+                            temperature:node.offSp //  We update all valve with the same Manual SP
+                        }
+                    };
+                    node.send([msg,null]);
+                });
+
+                let msg={};
+                msg.payload={
+                    command:"set",
+                    topic: node.topic,
+                    setpoint:node.offSp,
+                    temperature:refTemp,
+                    name:node.name,
+                    groupid:node.groupId
+                }
+
+                nlog("output to boiler");
+                nlog(JSON.stringify(msg));
+
+                node.send([null,msg]);
+
+                node.status({
+                    fill:  'gray',
+                    shape: 'dot',
+                    text:("Off sp: "+node.offSp+"°C, temp: "+refTemp+"°C")
+                });
+
+                return;
+            }
+
+            
+
             
             // Check if there is an update on the valve
             nlog("New cycle");
@@ -246,17 +304,17 @@ module.exports = function(RED) {
                     }
                 });
                 // Update the status in UI
-                if (Math.round(parseFloat(refTemp))>parseFloat(node.requestSp)){
+                if (/*Math.round(*/parseFloat(refTemp)/*)*/>parseFloat(node.requestSp)){
                     node.status({
                         fill:  'green',
                         shape: 'dot',
-                        text:("temp: "+Math.round(refTemp)+"°C, sp: "+node.requestSp+"°C")
+                        text:("temp: "+/*Math.round(*/refTemp/*)*/+"°C, sp: "+node.requestSp+"°C")
                     });
                 }else{
                     node.status({
                         fill:  'red',
                         shape: 'dot',
-                        text:("temp: "+Math.round(refTemp)+"°C, sp: "+node.requestSp+"°C")
+                        text:("temp: "+/*Math.round(*/refTemp/*)*/+"°C, sp: "+node.requestSp+"°C")
                     });
                 }
         
@@ -329,7 +387,7 @@ module.exports = function(RED) {
                         return;
                     }
                         
-                    let delta=currentTemperature-refTemp;
+                    let delta=currentTemperature-Math.floor(refTemp); // <---- Test on going
                     
                     if (node.adjustValveTempMode=="adjustValveTempMode.adjust.startup" || Math.abs(delta)>threshold){
                         let newCalibration=parseFloat(currentCalibration-delta).toFixed(2);

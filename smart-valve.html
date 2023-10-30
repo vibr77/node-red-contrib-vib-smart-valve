@@ -22,6 +22,16 @@
                 return true;
             }},
             cycleDuration: {value:"5"},
+            offSp: {value:"5",required:true,validate:function(v){
+                if (isNaN(v)){
+                    return false;
+                }
+
+                if (v<0 || v> 30){
+                    return false;
+                }
+                return true;
+            }},
             spUpdateMode:{value:"spUpdateMode.statechange.startup"},
             adjustValveTempMode:{value:"adjustValveTempMode.noAdjust"},
             adjustThreshold:{value:1,required:true,validate:function(v){
@@ -216,6 +226,12 @@
     <div class="form-row">
         <label for="node-input-tempEntity"><i class="fa fa-tasks"></i> Temperature</label>
         <input type="text" id="node-input-tempEntity" placeholder="Temperature entity"></input>
+    </div>
+
+    <div class="form-row">
+        <label for="node-input-offSp"><i class="fa fa-tasks"></i> Off setpoint</label>
+        <input type="text" id="node-input-offSp"  style="width:60px !important; text-align: right;" placeholder="temperature"></input>
+        <label for="node-input-offSp">°C</label>
     </div>
 
     <div class="form-row node-input-climate-container-row">
