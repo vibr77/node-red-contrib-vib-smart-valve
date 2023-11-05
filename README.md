@@ -1,7 +1,13 @@
 # Smart-valve 
     
-WORK IN PROGRESS, help me and log any issue
-is part of a suite of nodes to manage multi room heating system based on TRV and boiler
+The purpose of this project was to replace at my house the existing NETATMO system (very good but not integrated in Home assistant and with no repeater).
+
+I have a boiler with Opentherm Card and a dedicated dev with ESP32 https://github.com/vibr77/Opentherm_HA_MQTT
+
+Changelog 20231031: 
+- Fixe BRT-100-TRV firmware issue (TRV wrong position stay at 25% open position) with a work around on current temperature
+
+Smart-Valce is part of a suite of nodes to manage multi room heating system based on TRV and boiler
 - Smart-Scheduler: multi-zonning SmartScheduler,
 - Smart-Valve: Valve grouping, auto-calibration, manual override,
 - Smart-Boiler: Boiler OpenTherm, multi valve management.
@@ -14,6 +20,16 @@ is part of a suite of nodes to manage multi room heating system based on TRV and
  - Multiple valves updates,
  - TRV temperture Recalibration based on the external temperature sensor,
  - Manual update directly on the valve to trigger override message to the scheduler and update the other valve
+
+### Key Features:
+- TRV auto calibration with an external source
+- Detection of manual update direcly on TRV
+- Fixe BRT-100-TRV issue on valve postion that stay open
+- Multi valves in the same room management
+- Multi mode execution Off / auto / Manual
+- Multi trigger execution: every cycle, at startup, on change.
+
+
 
 ### Inputs
     

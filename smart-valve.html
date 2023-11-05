@@ -108,7 +108,8 @@
             if (!this.climates) {
                 var climate = {
                     entity:"",
-                    calibration:""
+                    calibration:"",
+                    valvePosition:"",
                     
                 };
                 this.climates = [climate];
@@ -125,7 +126,7 @@
                     }
                     node.climates[i].ruleIdx=i;
                     if (!climate.hasOwnProperty('entity')) {
-                        climate = {entity:"",calibration:""};
+                        climate = {entity:"",calibration:"",valvePosition:""};
                     }
 
                     $(container).data('data',i);
@@ -133,7 +134,8 @@
                     
                     var row1 = $('<div/>',{style:"display:flex; align-items: baseline"}).appendTo(fragment);
                     var row2 = $('<div/>',{style:"margin-top:8px;"}).appendTo(fragment);
-                
+                    var row3 = $('<div/>',{style:"margin-top:8px;"}).appendTo(fragment);
+
                     $('<label  style="width:20px !important; text-align: left;"><span><i class="fa fa-share-alt"/><b>'+(i+1)+'</b></span></label>').appendTo(row1);
                     $('<label  style="text-align: right; margin-right:5px;"><span>Climate:</span></label>').appendTo(row1);
                     $('<input type="text" id="node-input-climateEntity_'+i+'" idx="'+i+'" class="node-input-climateEntity" placeholder="Climate entity" >').appendTo(row1);
@@ -143,10 +145,16 @@
                     $('<label style="text-align: right; margin-right:5px;"><span>Calibration:</span></label>').appendTo(row2_1);
                     $('<input type="text" id="node-input-calibrationEntity_'+i+'" idx="'+i+'" class="node-input-calibrationEntity" placeholder="Calibration entity" >').appendTo(row2_1);
                     
+                    var row3_1 = $('<div/>', {style:"display:flex;align-items: baseline"}).appendTo(row3);
+                    $('<label  style="width:20px !important; text-align: left;"><span></span></label>').appendTo(row3_1);
+                    $('<label style="text-align: right; margin-right:5px;"><span>Valve position:</span></label>').appendTo(row3_1);
+                    $('<input type="text" id="node-input-valvePositionEntity_'+i+'" idx="'+i+'" class="node-input-valvePositionEntity" placeholder="valve position entity" >').appendTo(row3_1);
+
                     container[0].appendChild(fragment);
 
                     $('#node-input-climateEntity_'+i).val(climate.entity);
                     $('#node-input-calibrationEntity_'+i).val(climate.calibration);
+                    $('#node-input-valvePositionEntity_'+i).val(climate.valvePosition);
 
                     $('#node-input-climateEntity_'+i).keyup(function (event) {
                         ctrl_i=$(event.target).attr('idx');
@@ -157,17 +165,22 @@
                         ctrl_i=$(event.target).attr('idx');
                         node.climates[ctrl_i].calibration=$('#node-input-calibrationEntity_'+ctrl_i).val();
                     });
+
+                    $('#node-input-valvePositionEntity_'+i).keyup(function (event) {
+                        ctrl_i=$(event.target).attr('idx');
+                        node.climates[ctrl_i].valvePosition=$('#node-input-valvePositionEntity_'+ctrl_i).val();
+                        console.log("here");
+                    });
                 },
                 removeItem:function(data) {
-                    //console.log("remove");
-                    //console.log(data);
+
                 },
                 resizeItem: function(row,index) {
                     var originalData = $(row).data('data');
                     console.log("Resize the row for item:", originalData)
                 },
                 resize: function() {
-                    //console.log("I have changed in size")
+
                 }
             });
 
@@ -178,11 +191,7 @@
         },
         oneditsave: function() {
             var node = this;
-            //node.outputs=2;
-            //node.inputs=1;
-            //node.spUpdateMode=$("#node-input-spUpdateMode").find(":selected").val();
-            //node.adjustValveTempMode=$("#node-input-adjustValveTempMode").find(":selected").val();
-            //node.allowGroupManualSp=$("#node-input-allowGroupManualSp").find(":selected").val();
+            
             var climates = $("#node-input-climate-container").editableList('items');
             node.climates= [];
 
@@ -191,10 +200,12 @@
                 var climate = $(this);
                 var r = {
                     entity:climate.find(".node-input-climateEntity").val(),
-                    calibration:climate.find(".node-input-calibrationEntity").val()
+                    calibration:climate.find(".node-input-calibrationEntity").val(),
+                    valvePosition:climate.find(".node-input-valvePositionEntity").val(),
                 }
                 node.climates.push(r);
             });
+            console.log(node.climates);
         },
         oneditresize: function() {
 

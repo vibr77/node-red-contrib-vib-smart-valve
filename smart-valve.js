@@ -160,8 +160,85 @@ module.exports = function(RED) {
             }
 
             
+            // Address the BRT-100-TRV Firmware Bug
+           /* let return_flag=false;
+            node.climates.forEach(async (climate) => {                             
 
-            
+                if (climate.entity === null || climate.entity === "") {
+                    node.warn("climate.entity is null or empty skipping");
+                    return;
+                }
+                
+                let climateEntity=global.get("homeassistant.homeAssistant.states['"+climate.entity+"']");
+                if (climateEntity===undefined || climateEntity.attributes===undefined || climateEntity.attributes.temperature===undefined){
+                    node.warn("climateEntity is invalid => undefined skipping")
+                    return;
+                }
+
+                let sp=parseInt(climateEntity.attributes.temperature);
+                let ct=parseInt(climateEntity.attributes.current_temperature);
+                
+                let valvePosition=global.get("homeassistant.homeAssistant.states['"+climate.valvePosition+"'].state");
+               
+        
+                nlog("ct:"+ct+", sp:"+sp+" valvepostion:"+valvePosition);
+
+                if (valvePosition===undefined){
+                    node.warn("valvePositionEntity is invalid=> undefined skipping")
+                    return;
+                }
+
+                const delay = millis => new Promise((resolve, reject) => {
+                    setTimeout(_ => resolve(), millis)
+                });
+                
+                if (ct>=sp && valvePosition>0){
+                    node.warn("BRT-100-TRV 25% Positionning issue ongoing:"+climate.entity);
+                    return_flag=true;
+
+                    let msg={};
+                    let sp_tmp=sp-5;
+                    msg.payload={
+                        topic: node.topic,
+                        domain:"climate",
+                        service:"set_temperature",
+                        target:{
+                            entity_id:[
+                                climate.entity
+                            ]
+                        },
+                        data:{
+                            temperature:sp_tmp //  We update all valve with the same Manual SP
+                        }
+                    };
+                    
+                    node.send([msg,null]);
+
+                    await delay(15000);
+
+                    msg.payload={
+                        topic: node.topic,
+                        domain:"climate",
+                        service:"set_temperature",
+                        target:{
+                            entity_id:[
+                                climate.entity
+                            ]
+                        },
+                        data:{
+                            temperature:sp //  We update all valve with the same Manual SP
+                        }
+                    };
+                
+                    node.send([msg,null]);
+                }
+            });
+
+            if (return_flag==true){
+                node.warn("BRT-100-TRV bug position returning");
+                return;
+            }
+                */
             // Check if there is an update on the valve
             nlog("New cycle");
             nlog("  node.manualTrigger:"+node.manualTrigger);
