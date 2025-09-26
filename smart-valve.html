@@ -7,7 +7,9 @@
         defaults: {
             name: {value:""},
             topic:{value:""},
+            mqttSettings: {value: "", type: "smart-valve-settings"},
             tempEntity: {value:"",required: true},
+            tempEntityTopic: {value:"",required: true},
             groupId:{value:"1",required: true,validate:function(v) {
                 if (isNaN(v)){
                     return false;
@@ -18,7 +20,7 @@
                 }
                 return true;
             }},
-            climates:{value:[{entity:"",calibration:""}],validate: function(rules, opt) {
+            climates:{value:[{entity:"",valveExtTempTopic:""}],validate: function(rules, opt) {
                 return true;
             }},
             cycleDuration: {value:"5"},
@@ -34,16 +36,7 @@
             }},
             spUpdateMode:{value:"spUpdateMode.statechange.startup"},
             adjustValveTempMode:{value:"adjustValveTempMode.noAdjust"},
-            adjustThreshold:{value:1,required:true,validate:function(v){
-                if (isNaN(v)){
-                    return false;
-                }
-
-                if (v<0 || v> 9){
-                    return false;
-                }
-                return true;
-            }},
+            
             debugInfo:{value:false},
             allowOverride:{value:false},
            
@@ -83,34 +76,13 @@
         },
         oneditprepare: function() {
             var node = this;
-            /*
-            $("#node-input-spUpdateMode").val(node.spUpdateMode ? node.spUpdateMode : 'spUpdateMode.statechange.startup'); 
-            $("#node-input-adjustValveTempMode").val(node.adjustValveTempMode ? node.adjustValveTempMode : 'adjustValveTempMode.noAdjust'); 
-            
-            $("#node-input-adjustThreshold").val(this.adjustThreshold);
-            
-            $("#node-input-name").keyup(function (event) {
-                this.name=$('#node-input-name').val();
-            });
-
-            $("#node-input-topic").keyup(function (event) {
-                this.topic=$('#node-input-topic').val();
-            });
-
-            $("#node-input-tempEntity").keyup(function (event) {
-                this.tempEntity=$('#node-input-tempEntity').val();
-            });
-
-            $("#node-input-cycleDuration").keyup(function (event) {
-                this.cycleDuration=$('#node-input-cycleDuration').val();
-            })            
-            */
+        
             if (!this.climates) {
                 var climate = {
                     entity:"",
-                    calibration:"",
-                    valvePosition:"",
-                    
+                    entityTopic:"",
+                    valveExtTempTopic:"",
+                    valveSpTopic:""
                 };
                 this.climates = [climate];
             }
@@ -126,7 +98,7 @@
                     }
                     node.climates[i].ruleIdx=i;
                     if (!climate.hasOwnProperty('entity')) {
-                        climate = {entity:"",calibration:"",valvePosition:""};
+                        climate = {entity:"",valveExtTempTopic:"",entityTopic:"",valveSpTopic:""};
                     }
 
                     $(container).data('data',i);
@@ -135,6 +107,7 @@
                     var row1 = $('<div/>',{style:"display:flex; align-items: baseline"}).appendTo(fragment);
                     var row2 = $('<div/>',{style:"margin-top:8px;"}).appendTo(fragment);
                     var row3 = $('<div/>',{style:"margin-top:8px;"}).appendTo(fragment);
+                    var row4 = $('<div/>',{style:"margin-top:8px;"}).appendTo(fragment);
 
                     $('<label  style="width:20px !important; text-align: left;"><span><i class="fa fa-share-alt"/><b>'+(i+1)+'</b></span></label>').appendTo(row1);
                     $('<label  style="text-align: right; margin-right:5px;"><span>Climate:</span></label>').appendTo(row1);
@@ -142,35 +115,46 @@
                     
                     var row2_1 = $('<div/>', {style:"display:flex;align-items: baseline"}).appendTo(row2);
                     $('<label  style="width:20px !important; text-align: left;"><span></span></label>').appendTo(row2_1);
-                    $('<label style="text-align: right; margin-right:5px;"><span>Calibration:</span></label>').appendTo(row2_1);
-                    $('<input type="text" id="node-input-calibrationEntity_'+i+'" idx="'+i+'" class="node-input-calibrationEntity" placeholder="Calibration entity" >').appendTo(row2_1);
+                    $('<label style="text-align: right; margin-right:5px;"><span>Ext temp topic:</span></label>').appendTo(row2_1);
+                    $('<input type="text" id="node-input-valveExtTempTopic_'+i+'" idx="'+i+'" class="node-input-valveExtTempTopic" placeholder="Valve Ext temp topic" >').appendTo(row2_1);
                     
                     var row3_1 = $('<div/>', {style:"display:flex;align-items: baseline"}).appendTo(row3);
-                    $('<label  style="width:20px !important; text-align: left;"><span></span></label>').appendTo(row3_1);
-                    $('<label style="text-align: right; margin-right:5px;"><span>Valve position:</span></label>').appendTo(row3_1);
-                    $('<input type="text" id="node-input-valvePositionEntity_'+i+'" idx="'+i+'" class="node-input-valvePositionEntity" placeholder="valve position entity" >').appendTo(row3_1);
+                    $('<label  style="width:20px !important; text-align: left;"><span><i class="fa fa-share-alt"/><b>'+(i+1)+'</b></span></label>').appendTo(row3_1);
+                    $('<label  style="text-align: right; margin-right:5px;"><span>Entity Topic:</span></label>').appendTo(row3_1);
+                    $('<input type="text" id="node-input-climateEntityTopic_'+i+'" idx="'+i+'" class="node-input-climateEntityTopic" placeholder="Entity topic" >').appendTo(row3_1);
+
+                    var row4_1 = $('<div/>', {style:"display:flex;align-items: baseline"}).appendTo(row4);
+                    $('<label  style="width:20px !important; text-align: left;"><span><i class="fa fa-share-alt"/><b>'+(i+1)+'</b></span></label>').appendTo(row4_1);
+                    $('<label  style="text-align: right; margin-right:5px;"><span>SetPoint Topic:</span></label>').appendTo(row4_1);
+                    $('<input type="text" id="node-input-valveSpTopic_'+i+'" idx="'+i+'" class="node-input-valveSpTopic" placeholder="Sp topic" >').appendTo(row4_1);
 
                     container[0].appendChild(fragment);
 
                     $('#node-input-climateEntity_'+i).val(climate.entity);
-                    $('#node-input-calibrationEntity_'+i).val(climate.calibration);
-                    $('#node-input-valvePositionEntity_'+i).val(climate.valvePosition);
+                    $('#node-input-climateEntityTopic_'+i).val(climate.entityTopic);
+                    $('#node-input-valveExtTempTopic_'+i).val(climate.valveExtTempTopic);
+                    $('#node-input-valveSpTopic_'+i).val(climate.valveSpTopic);
 
                     $('#node-input-climateEntity_'+i).keyup(function (event) {
                         ctrl_i=$(event.target).attr('idx');
                         node.climates[ctrl_i].entity=$('#node-input-climateEntity_'+ctrl_i).val();
                     });
 
-                    $('#node-input-calibrationEntity_'+i).keyup(function (event) {
+                    $('#node-input-valveSpTopic_'+i).keyup(function (event) {
                         ctrl_i=$(event.target).attr('idx');
-                        node.climates[ctrl_i].calibration=$('#node-input-calibrationEntity_'+ctrl_i).val();
+                        node.climates[ctrl_i].valveSpTopic=$('#node-input-valveSpTopic_'+ctrl_i).val();
                     });
 
-                    $('#node-input-valvePositionEntity_'+i).keyup(function (event) {
+                    $('#node-input-climateEntityTopic_'+i).keyup(function (event) {
                         ctrl_i=$(event.target).attr('idx');
-                        node.climates[ctrl_i].valvePosition=$('#node-input-valvePositionEntity_'+ctrl_i).val();
-                        console.log("here");
+                        node.climates[ctrl_i].entityTopic=$('#node-input-climateEntityTopic_'+ctrl_i).val();
                     });
+
+                    $('#node-input-valveExtTempTopic_'+i).keyup(function (event) {
+                        ctrl_i=$(event.target).attr('idx');
+                        node.climates[ctrl_i].valveExtTempTopic=$('#node-input-valveExtTempTopic_'+ctrl_i).val();
+                    });
+
                 },
                 removeItem:function(data) {
 
@@ -200,8 +184,9 @@
                 var climate = $(this);
                 var r = {
                     entity:climate.find(".node-input-climateEntity").val(),
-                    calibration:climate.find(".node-input-calibrationEntity").val(),
-                    valvePosition:climate.find(".node-input-valvePositionEntity").val(),
+                    valveExtTempTopic:climate.find(".node-input-valveExtTempTopic").val(),
+                    valveSpTopic:climate.find(".node-input-valveSpTopic").val(),
+                    entityTopic:climate.find(".node-input-climateEntityTopic").val(),
                 }
                 node.climates.push(r);
             });
@@ -230,6 +215,10 @@
         <input type="text" id="node-input-topic" placeholder="Topic"></input>
     </div>
     <div class="form-row">
+        <label for="node-input-mqttSettings"><i class="fa fa-globe"></i> Mqtt</label>
+        <input type="text" id="node-input-mqttSettings"></input>
+    </div>
+    <div class="form-row">
         <label for="node-input-topic"><i class="fa fa-tasks"></i> Group id </label>
         <input type="text" id="node-input-groupId" placeholder="id"></input>
     </div>
@@ -237,6 +226,11 @@
     <div class="form-row">
         <label for="node-input-tempEntity"><i class="fa fa-tasks"></i> Temperature</label>
         <input type="text" id="node-input-tempEntity" placeholder="Temperature entity"></input>
+    </div>
+
+    <div class="form-row">
+        <label for="node-input-tempEntityTopic"><i class="fa fa-tasks"></i> Temperature topic</label>
+        <input type="text" id="node-input-tempEntityTopic" placeholder="Temperature topic"></input>
     </div>
 
     <div class="form-row">
@@ -271,14 +265,8 @@
         <select id="node-input-adjustValveTempMode">
             <option value="adjustValveTempMode.noAdjust">No</option>
             <option value="adjustValveTempMode.adjust.startup">Yes</option>
-            <option value="adjustValveTempMode.adjust.threshold">Yes with threshold</option>
         </select>
     </div>
-    <div class="form-row">
-        <label style="width:120px !important;" for="node-input-adjustThreshold"><i class="fa fa-tasks"></i> delta threshold</label>
-        <input type="text" id="node-input-adjustThreshold" style="width:60px !important; text-align: right;" placeholder="delta"></input>
-        <label for="node-input-adjustThreshold"> °C</label>
-    </div> 
     <div class="form-row">
         <label style="width:120px !important;" for="node-input-debugInfo"><i class="fa fa-tasks"></i> Debug</label>
         <input type="checkbox" title="send debug information to the console" id="node-input-debugInfo"  ></input>

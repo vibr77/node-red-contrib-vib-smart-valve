@@ -4,6 +4,10 @@ The purpose of this project was to replace at my house the existing NETATMO syst
 
 I have a boiler with Opentherm Card and a dedicated dev with ESP32 https://github.com/vibr77/Opentherm_HA_MQTT
 
+
+Changelog 20240102:
+- Add a mecanism for manual update on the TRV (wip)
+
 Changelog 20231031: 
 - Fixe BRT-100-TRV firmware issue (TRV wrong position stay at 25% open position) with a work around on current temperature
 
