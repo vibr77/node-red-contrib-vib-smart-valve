@@ -10,6 +10,10 @@ ______________________
 
 // Install npm install ./modulename (SmartValve / SmartBoiler / SmartSchedule)
 // Terminal command:  node-red -v -D logging.console.level=trace
+// to push to npmjs
+// npm publish
+
+
 // Web http://localhost:1880/
 
 var moment = require('moment');
@@ -770,6 +774,7 @@ module.exports = function(RED) {
 
         node.on('close', function() {
             nlog("closing connexion");
+            node.log('MQTT disconnecting');
             clearInterval(node.evalInterval);
             node.mqttclient.end();
             done();
