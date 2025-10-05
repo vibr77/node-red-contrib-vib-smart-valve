@@ -102,11 +102,10 @@ module.exports = function(RED) {
                 let data={};
                 try {
                     data=JSON.parse(inputD.toString());
+                    //JSON.parse(inputD.toString());
                 } catch (e) {
                 
                 } 
-                
-                JSON.parse(inputD.toString());
 
                 if (data.requestSp!=undefined){
                     node.requestSp=data.requestSp;
@@ -739,10 +738,10 @@ module.exports = function(RED) {
                 clientId,
                 clean: true,
                 keepalive:60,
-                connectTimeout: 4000,
+                connectTimeout: 40000,
                 username: node.mqttSettings.mqttUser,
                 password: node.mqttSettings.mqttPassword,
-                reconnectPeriod: 1000,
+                reconnectPeriod: 10000,
             });
 
             node.mqttclient.on('error', function (error) {
@@ -770,7 +769,11 @@ module.exports = function(RED) {
         }
 
         node.on('close', function() {
-            clearInterval(node.evalInterval)
+            nlog("closing connexion");
+            clearInterval(node.evalInterval);
+            node.mqttclient.end();
+            done();
+
         })
 
     }
