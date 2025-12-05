@@ -1,24 +1,27 @@
 
 /*
 __   _____ ___ ___        Author: Vincent BESSON
- \ \ / /_ _| _ ) _ \      Release: 0.72
-  \ V / | || _ \   /      Date: 20230930
+ \ \ / /_ _| _ ) _ \      Release: 0.80
+  \ V / | || _ \   /      Date: 20251201
    \_/ |___|___/_|_\      Description: Nodered Heating Valve Management
-                2023      Licence: Creative Commons
+                2025      Licence: Creative Commons
 ______________________
 */ 
-
-// Install npm install ./modulename (SmartValve / SmartBoiler / SmartSchedule)
-// Terminal command:  node-red -v -D logging.console.level=trace
-// to push to npmjs
-// npm publish
-
-
+/* TEST Env
+npm install ./modulename (SmartValve / SmartBoiler / SmartSchedule)
+node-red -v -D logging.console.level=trace
 // Web http://localhost:1880/
+
+Deploy to npmjs
+npm publish
+
+*/
 
 var moment = require('moment');
 const mqtt = require("mqtt");
 const fs = require('fs');
+const { request } = require('http');
+const { group } = require('console');
 
 module.exports = function(RED) {
    
@@ -29,211 +32,182 @@ module.exports = function(RED) {
         RED.nodes.createNode(this, n)
         this.name = n.name
         this.settings = RED.nodes.getNode(n.settings) // Get global settings
-        var global = this.context().global;
         
-        this.topic = n.topic;
         this.groupId=n.groupId;                                                                         // GroupId <!> Important for the SmartBoiler, interger unique
-        this.climates = n.climates;                                                                     // Array of climate entities to be manages
-        this.tempEntity=n.tempEntity ? n.tempEntity : '';                                               // Reference Temperture entity
-        this.tempEntityTopic=n.tempEntityTopic ? n.tempEntityTopic : '';
         this.mqttSettings = RED.nodes.getNode(n.mqttSettings);                                          // MQTT connexion settings
         this.mqttstack=[]; 
         this.cycleDuration=n.cycleDuration ? parseInt(n.cycleDuration): 5;                              // duration cycle in min
         this.spUpdateMode=n.spUpdateMode ? n.spUpdateMode : 'spUpdateMode.statechange.startup';         // Execution mode [statechange|+startup|every cycle]
-        this.adjustValveTempMode=n.adjustValveTempMode ? n.adjustValveTempMode : 'adjustValveTempMode.noAdjust';
-        this.debugInfo=n.debugInfo? n.debugInfo :false;                                                 // debug verbose to the console
+                                                       
         this.allowOverride=n.allowOverride ? n.allowOverride :false;                                    // Allow Manual update from the valve // climate
         this.executionMode=true;
         this.offSp=n.offSp ? n.offSp: 5;
 
-        this.prevSp=0;
-        
-        this.prevRequestSp=undefined;
-        this.requestSp=undefined;
-        
-        this.firstEval = true;
-        this.valveManualSpUpdate=false;
-        this.valveManualSp=0;
-        this.startTs=0;
-        this.refTemp=undefined;
-        this.prevRefTemp=undefined;
+        this.temperatureSensorStateTopic=n.temperatureSensorStateTopic;
+        this.temperatureSensorKey=n.temperatureSensorKey;
 
-        this.lastInputTs=0;
-        this.mqttDiscardMessageLastInputDuration=15; // Mqtt Message will be discarded within x s duration after last input sp message (it is to avoid ping pong)
-        this.lastInputSp=0;
+        this.valveSetpointStateTopic=n.valveSetpointStateTopic;
+        this.valveSetpointSetTopic=n.valveSetpointSetTopic;
+        this.valveSetpointKey=n.valveSetpointKey;
+
+        this.valveTemperatureSetTopic=n.valveTemperatureSetTopic;
+        this.valveTemperatureKey=n.valveTemperatureKey;
+       
+        this.valveModeStateTopic=n.valveModeStateTopic;
+        this.valveModeSetTopic=n.valveModeSetTopic;
+        this.valveModeKey=n.valveModeKey;
+
+        this.valveTemperatureSensorTypeSetTopic=n.valveTemperatureSensorTypeSetTopic;
+        this.valveTemperatureSensorTypePayload=n.valveTemperatureSensorTypePayload;
+
+        this.t=0;                                   // Current temperature          
+        this.prevSp=0;                              // Previous setpoint     
+        this.sp=0;                                  // Current setpoint
+        this.requestSp=undefined;                   // Requested setpoint
+       
+        this.inputTrigger=false;                    // Request coming from input node
+        this.firstEval = true;                      // First evaluation cycle
+        
+        this.refTemp=undefined;                     // Reference temperature from sensor
+        this.prevRefTemp=undefined;                 // Previous reference temperature from sensor  
+
+        this.noOut=false;                        // To avoid output message when override from valve detected
+        
+        this.msgStormMsgCounter=0;
+        this.msgStormMaxMsg=n.msgStormMaxMsg ? parseInt(n.msgStormMaxMsg): 20;
+        this.debugInfo=n.debugInfo? n.debugInfo :"debug";                                                 // debug verbose to the console
+        this.msgStormInterval=10000; // 10 seconde
+        this.msgStormLastTs=0;
         var node = this;
-
-        node.previousRefTemp=0;
-        node.previousSp=0;
-        node.lastCycleTs=0;
-
-        node.manualTrigger=false;
-        function getRandomInt(min,max) {
+        
+        /*function getRandomInt(min,max) {
             return min+Math.floor(Math.random() * (max-min));
-        }
-        function nlog(msg){
-            if (node.debugInfo==true){
-                node.log(msg);
+        }*/
+
+        function nlog(msg, level="debug"){
+            const levels = {
+                "none": 0,
+                "error": 1,
+                "warn": 2,
+                "info": 3,
+                "debug": 4
+            };
+            const currentLevel = levels[node.debugInfo] || 0;
+            const msgLevel = levels[level] || 4;
+
+            if (msgLevel <= currentLevel){
+                if (level === "error") {
+                    node.error(msg);
+                } else if (level === "warn") {
+                    node.warn(msg);
+                } else {
+                    node.log(msg);
+                    // Also send to warn if it was previously doing so for debug visibility in sidebar
+                    // The original code did node.log AND node.warn for debugInfo=true
+                    if (level === "debug" || level === "info") {
+                         node.warn(msg); 
+                    }
+                }
             }
         }
 
         this.ev=function(){
-            node.manualTrigger=true;
+            node.inputTrigger=true;
             evaluate();
-        }
-        function flushDataToFS(){
-            let fs_name="data_"+node.id;
-            let data={};
-
-            data.climates=node.climates;
-            data.requestSp=node.requestSp;
-            data.prevRequestSp=node.prevRequestSp;
-            data.refTemp=node.refTemp;
-
-            fs.writeFile(fs_name, JSON.stringify(data), (err) => {
-                if (err) throw err;
-               });
-        }
-
-        function loadDataFromFs(){
-            let fs_name="data_"+node.id;
-            fs.readFile(fs_name, (err, inputD) => {
-                if (err){
-                    nlog("unable to open file:"+fs_name);
-                    return;
-                };
-
-                let data={};
-                try {
-                    data=JSON.parse(inputD.toString());
-                    //JSON.parse(inputD.toString());
-                } catch (e) {
-                
-                } 
-
-                if (data.requestSp!=undefined){
-                    node.requestSp=data.requestSp;
-                }
-
-                if (data.prevRequestSp!=undefined){
-                    node.prevRequestSp=data.prevRequestSp;
-                }
-
-                if (data.refTemp!=undefined){
-                    node.refTemp=data.refTemp;
-                }
-                 
-                if (data.climates!=undefined){
-                    node.climates.forEach((climate) => {
-                        data.climates.forEach((dclimate)=>{
-                            if (climate.entityTopic==dclimate.entityTopic){
-                                climate.sp=dclimate.sp;
-                                climate.t=dclimate.t;
-                                nlog("****************YESSSSS  **************************");
-                            }
-                        });
-                    });
-                }
-            });
-        }
-
-        function unlinkFs(){
-            let fs_name="data_"+node.id;
-            fs.unlinkSync(fs_name);
         }
 
         function subscribeMqtt(){
             let subArray=[];
 
             if (node.mqttclient==null || node.mqttclient.connected!=true){
-                node.warn("subscribeMqtt: MQTT not connected...");
+                nlog("subscribeMqtt: MQTT not connected...","error");
                 return;
             }
-            if (node.tempEntityTopic!=undefined && node.tempEntityTopic!=""){
-                subArray.push(node.tempEntityTopic);
+            try{
+                subArray.push(node.temperatureSensorStateTopic);
+                subArray.push(node.valveSetpointStateTopic);
+                subArray.push(node.temperatureSensorStateTopic);
+                subArray.push(node.valveModeStateTopic);
+                
+                node.mqttclient.subscribe(subArray, () => {
+                    nlog("MQTT Subscribed to topic:"+JSON.stringify(subArray),"debug");
+                })
+            }catch(err){
+                nlog("MQTT subscribe error:"+err.message,"error");
             }
-
-            node.climates.forEach((climate) => {
-                nlog("climateEntityTopic:"+climate.entityTopic);
-                if (climate!=undefined && climate.entityTopic!=undefined && climate.entityTopic!=""){
-                    subArray.push(climate.entityTopic);
-                }
-            });
-
-            node.mqttclient.subscribe(subArray, () => {
-                nlog("MQTT Subscribed to topic:");
-                nlog("  "+JSON.stringify(subArray));
-            })
         }
 
         function callbackMqtt(topic,p){
+            flgProcess=false;
+            if (topic==node.temperatureSensorStateTopic){
 
-            if (topic==node.tempEntityTopic){
-                nlog("   set mqtt refTemp:"+p.temperature);
-                node.refTemp=p.temperature;
-                if (node.refTemp!=node.refTemp){
-                    evaluate();
-                    node.prevRefTemp=node.refTemp;
-                }
-                
-                return;
-            }else{
-                let bTriggerProcess=false;
-                for ( climate of node.climates) {
-                
-                    if(climate!=undefined && climate.entityTopic!=undefined && climate.entityTopic==topic){
-                        nlog("   Match");
-                        nlog("   climate.entityTopic:"+climate.entityTopic);
-                        nlog("   topic:"+topic);
-                        nlog("   set mqtt climate prop:"+climate.entity);
-                        
-                        climate.lastSeen=moment();           //  hum p.last_seen;
-                        climate.sp=p.occupied_heating_setpoint;
-                        climate.t=p.local_temperature;
-
-                        if (node.refTemp===undefined){
-                            node.refTemp=p.local_temperature;
-                            nlog("   set node.reftemp:"+p.local_temperature);
-                            nlog("   bTriggerProcess:true");
-                            bTriggerProcess=true;
-                        }
-
-                        if (node.requestSp===undefined){
-                            node.requestSp=p.occupied_heating_setpoint;
-                            nlog("   set node.requestSp:"+p.occupied_heating_setpoint);
-                            nlog("   bTriggerProcess:true");
-                            bTriggerProcess=true;
-                        }
-
-                        if (climate.sp!=node.requestSp && climate.sp!=node.prevRequestSp){
-                            nlog("   climate.sp!=node.requestSp");
-                            nlog("   climate.sp:"+climate.sp+" <> node.requestSp:"+node.requestSp);
-                            nlog("   climate.sp:"+climate.sp+" <> node.prevRequestSp:"+node.prevRequestSp);
-                            
-                            let now = moment();
-                            let diff=now.diff(node.lastInputTs)/1000;
-
-                            nlog("  lastInputTs Elapsed:"+diff);
-                            if (diff>node.mqttDiscardMessageLastInputDuration){
-                                nlog("  mqttDiscardMessageLastInputDuration:"+node.mqttDiscardMessageLastInputDuration);
-                                nlog("   bTriggerProcess:true");
-                                bTriggerProcess=true;
-                            }else{
-                                nlog("   bTriggerProcess:false");
-                            }
-                        }
-                        break;;
-                    }
+                if (p[node.temperatureSensorKey]===undefined){
+                    nlog(`MQTT Invalid payload key:${node.temperatureSensorKey}, topic:${topic}`,"warn");   
+                    return;
                 }
 
-                if (bTriggerProcess==true){
-                    nlog("   bTriggerProces sp changed-> trigger evaluate();");
-                    evaluate();
-                    bTriggerProcess=false;
+                node.refTemp=p[node.temperatureSensorKey];
+                nlog(`[MQTT] receive reference temperature:${node.refTemp}`,"debug");
+
+                if (node.refTemp!=node.prevRefTemp){
+                    nlog("refTemp changed -> trigger","debug");
+                    flgProcess=true;
                 }else{
-                    nlog("   no trigger...")
+                    nlog("no refTemp change...","debug");
                 }
-            } 
+            }
+
+            if (topic==node.valveSetpointStateTopic){
+            
+                if (p[node.valveSetpointKey]===undefined){
+                    nlog(`MQTT Invalid payload key:${node.valveSetpointKey}, topic:${topic}`,"warn");
+                    return;
+                }
+
+                let valveSp=p[node.valveSetpointKey];
+                nlog(`[MQTT] receive valve setpoint:${valveSp}`,"debug");
+                node.requestSp=valveSp;
+
+                if (node.sp!=node.requestSp || node.requestSp!=node.prevSp){
+                    nlog("flgProcess:true","debug");
+                    flgProcess=true;
+                }
+            }
+            
+            if (topic==node.valveModeTopic){
+                if (p[node.valveModeKey]===undefined){
+                    nlog(`MQTT Invalid payload key:${node.valveModeKey}, topic:${topic}`,"warn");
+                    return;
+                }
+                let mode=p[node.valveModeKey];
+                nlog(`[MQTT] receive valve mode:${mode}`,"debug");
+
+                if (mode.match(/^(heat|1|on)$/i)){
+                    if (node.executionMode==false){
+                        nlog("MQTT valve mode changed to ON -> trigger","debug");
+                        node.executionMode=true;
+                        flgProcess=true;
+                    }else{
+                        nlog("no executionMode change...","debug");
+                    }
+                }else if (mode.match(/^(0|off)$/i)){
+                    if (node.executionMode==true){
+                        nlog("MQTT valve mode changed to OFF -> trigger","debug");
+                        node.executionMode=false;
+                        flgProcess=true;
+                    }else{
+                        nlog("no executionMode change...","debug");
+                    }
+                }   
+            }
+
+            if (flgProcess==true){
+                nlog("flgProcess sp/refTemp changed-> trigger evaluate();","debug");
+                evaluate();
+                flgProcess=false;
+            }else{
+                nlog("no trigger...")
+            }   
         }
 
         function sendMqtt(){
@@ -246,7 +220,7 @@ module.exports = function(RED) {
             let msg=node.mqttstack.shift();
             
             while (msg!==undefined){
-                nlog('MQTT-> msg dequeueing');
+                nlog('MQTT-> msg dequeueing',"debug");
                
                 if (msg.topic===undefined || msg.payload===undefined)
                     return;
@@ -267,134 +241,121 @@ module.exports = function(RED) {
             }
 
             let command=msg.payload.command;
-            if (command !==undefined && command.match(/^(1|set|on|0|off|trigger)$/i)) {
+            if (command !==undefined && command.match(/^(1|set|on|0|off|trigger|override)$/i)) {
                 
-                if (command == '1' || command== 'trigger' || command == 'on' || command == 'set'){
+                if (command == '1' || command== 'trigger' || command == 'on' || command == 'set' || command=='override'){
                     
                     if (command=='on'){
                         node.executionMode=true;
-                        evaluate();
-                        return;
                     }
 
-                    if (node.executionMode==false){
-                        evaluate();
-                        return;
-                    }
+                    else if (command=='trigger' || command=='1'){
                         
-                    if (msg.payload.setpoint=== undefined || isNaN(msg.payload.setpoint) || parseFloat(msg.payload.setpoint)<0 || parseFloat(msg.payload.setpoint)>35){ //<----------- Todo define Max & Min in config
-                        node.warn('received trigger missing or invalid msg.sp number');
-                        return;
                     }
 
-                    node.manualTrigger = true;
-                    node.prevRequestSp=node.requestSp;
-                    node.requestSp=parseFloat(msg.payload.setpoint).toFixed(2);
+                    else if (command=='set' || command=='override'){
 
-                    nlog("incoming request sp:"+node.requestSp);
+                        if (command=="set" && msg.payload.setpoint=== undefined || isNaN(msg.payload.setpoint) || parseFloat(msg.payload.setpoint)<0 || parseFloat(msg.payload.setpoint)>40){ //<----------- Todo define Max & Min in config
+                            nlog('received trigger missing or invalid msg.sp number',"error");
+                            return;
+                        }
 
-                    node.lastInputTs=moment();
-                    this.lastInputSp=node.requestSp;
+                        if (command=="override" && node.allowOverride==true && node.executionMode==true && msg.payload.requestedBy!==undefined && msg.payload.groupId!==undefined){
+                            if (msg.payload.requestedBy!=node.name && msg.payload.groupId==node.groupId){
+                                nlog("Command:override, requestedBy:"+msg.payload.requestedBy+" != node.name:"+node.name+" -> process override","debug")
+                            }else{
+                                nlog("Command:override, requestedBy:"+msg.payload.requestedBy+" == node.name:"+node.name+" || node.groupId!="+msg.payload.groupId+" -> ignoring own override","debug")
+                                return;
+                            }
+                        }
+
+                        else if (command=="override"){
+                            nlog("Command:override  -> ignoring msg.payload:"+JSON.stringify(msg.payload),"debug")
+
+                            return;
+                        }
+
+                        if (msg.payload.temperature=== undefined || isNaN(msg.payload.temperature) || parseFloat(msg.payload.temperature)<0 || parseFloat(msg.payload.temperature)>40){
+                            
+                        }else{
+                            node.refTemp=parseFloat(msg.payload.temperature).toFixed(2);
+                        }
+
+                        node.requestSp=parseFloat(msg.payload.setpoint).toFixed(2);
+                       
+                    }
+
+                    if (msg.payload.noOut===true) {
+                        node.noOut=true;
+                    }
                     
-                    node.executionMode=true;
-                    evaluate();
-                }else if(command=="0"|| command=='off'){
-                    nlog("set smart-valve off")
-                    node.executionMode=false;
-                    evaluate();
+                }else if(command=="0" || command=='off'){
+                    nlog(`Command:${command}, set smart-valve off`,"debug");
+                    node.executionMode=false;     
                 }
+                
+                node.inputTrigger = true;
+                nlog("msg:"+JSON.stringify(msg.payload),"debug");
 
-            } else node.warn('Failed to interpret incoming msg.payload. Ignoring it!')
+                nlog(`Command:${command}, sp:${node.requestSp}, noOut:${node.noOut},inputTrigger:${node.inputTrigger}, executionMode:${node.executionMode}`,"debug");
+                                                       
+                evaluate();
+
+            } else 
+                nlog('evaluate(): unhandled msg.payload:'+JSON(msg.payload),"debug");
         });
 
         function evaluate() {
 
-            /* Evaluation process to trigger action
-            //  -> Phase 1 : check if a manual update occured directly on the valve
-                -> Phahse 2a If yes then:
-                  phase2_ManualUpdate(); -> update all the valve with the new value
-                -> Phahse 2b If no Then:
-                  phase2_UpdateValve(); -> update the valve with the last node.requestSp
-       
-                -> Phase 3 phase3_UpdateExtTemperature() -> update the external temp value on the TRV
-                -> Phase 4 phase4_UpdateBoiler() -> update the boiler
-                -> Phase 5 flushDataToFS -> save current data
-            */
-
+            nlog(`evaluate(): node.inputTrigger:${node.inputTrigger} node.firstEval:${node.firstEval} node.refTemp:${node.refTemp} node.requestSp:${node.requestSp} node.prevSp:${node.prevSp} allowOverride:${node.allowOverride}`,"debug");
             
-            nlog("---------------------------------------");
-            nlog("Evaluate() new cycle");
-            nlog("---------------------------------------");
-            nlog("   node.manualTrigger:"+node.manualTrigger);
-            nlog("   node.firstEval:"+node.firstEval);
-            nlog("   node.refTemp:"+node.refTemp);
-            nlog("   node.requestSp:"+node.requestSp);
-            nlog("   allowOverride:"+node.allowOverride);
+            node.msgStormMsgCounter+=1;
 
-            let now = moment();                                             // <-------- 60 s is needed for Home assistant to update
-            let diff=now.diff(node.lastCycleTs)/1000;
+            if (moment().diff(node.msgStormLastTs)>node.msgStormInterval){
+                node.msgStormMsgCounter=1;
+            }
+            node.msgStormLastTs=moment();
 
-            nlog("   lastCycleTs elapsed:"+diff);
-            if (diff<10){                                                   // <----------to avoid ping pong party
-                nlog("   lastCycle elapsed too short < 10s returning");
+            if (node.msgStormMsgCounter>node.msgStormMaxMsg){
+                nlog(`evaluate(): <!> Message storm detected: ${node.msgStormMsgCounter} messages within ${node.msgStormInterval/1000}s, evaluate() aborted!`,"error");
                 return;
             }
+        
+            if (node.refTemp===undefined || node.requestSp===undefined /*|| node.sp===undefined*/){
+                nlog("evaluate(): node.refTemp or node.requestSp is undefined returning","debug");
+                let t=node.refTemp!==undefined ? node.refTemp : "?";
+                let sp=node.requestSp!==undefined ? node.requestSp : "?";
 
-            node.lastCycleTs=moment(); // to avoid ping pong party
-
-            if (node.refTemp===undefined || node.requestSp===undefined){
-                nlog("   <!> evaluate(): node.refTemp or node.requestSp is undefined returning");
                 node.status({
-                    fill:  'yellow',
-                    shape: 'dot',
-                    text:("Unavailable sp: "+node.requestSp+"°C, temp: "+node.refTemp+"°C")
+                    fill: 'yellow',
+                    shape:'dot',
+                    text:("Not ready t:"+t+"°C, sp:"+sp+"°C")
                 });
-                // Change 1 parameters to the valve to trigger full update
-                // Warning: to be fixed cause a little bit dirty
-                if (node.climates[0]!=undefined && node.climates[0].entityTopic!=undefined && node.climates[0].entityTopic!=""){
-                    let rndInt=getRandomInt(-10,10);
-                    nlog("  away_preset_temperature updating with random int:"+rndInt)
-                    let mqttmsg={topic:node.climates[0].entityTopic+"/set/away_preset_temperature",payload:rndInt.toString(),qos:0,retain:false};
-                    node.mqttstack.push(mqttmsg);
-                    sendMqtt();
-               }
+
                 return;
+
             }else{
-                if (/*Math.round(*/parseFloat(node.refTemp)/*)*/>parseFloat(node.requestSp)){
+                if (parseFloat(node.refTemp)>=parseFloat(node.requestSp)){
                     node.status({
                         fill:  'green',
                         shape: 'dot',
-                        text:("temp: "+/*Math.round(*/node.refTemp/*)*/+"°C, sp: "+node.requestSp+"°C")
+                        text:("idle t:"+node.refTemp+"°C, sp:"+node.requestSp+"°C")
                     });
                 }else{
                     node.status({
                         fill:  'red',
                         shape: 'dot',
-                        text:("temp: "+/*Math.round(*/node.refTemp/*)*/+"°C, sp: "+node.requestSp+"°C")
+                        text:("Heat t:"+node.refTemp+"°C, sp:"+node.requestSp+"°C")
                     });
                 }
             }
 
             if (node.executionMode==false){                             // <--- Put default temperature mode
-                nlog("<!> smart-valve is off returning");
-                node.climates.forEach((climate) => {
-
-                    let msg={};
-                    msg.payload={
-                        topic: node.topic,
-                        domain:"climate",
-                        service:"set_temperature",
-                        target:{
-                            entity_id:[
-                                climate.entity
-                            ]
-                        },
-                        data:{
-                            temperature:node.offSp //  We update all valve with the same Manual SP
-                        }
-                    };
-                    node.send([msg,null]);
-                });
+                
+                if (isNaN(node.offSp) || parseFloat(node.offSp) < 0 || parseFloat(node.offSp) > 40) {
+                    nlog("evaluate(): Invalid offSp value, setting to default 5°C", "warn");
+                    node.offSp = 5;
+                }
 
                 let msg={};
                 msg.payload={
@@ -402,335 +363,137 @@ module.exports = function(RED) {
                     topic: node.topic,
                     setpoint:node.offSp,
                     temperature:node.refTemp,
-                    name:node.name,
-                    groupid:node.groupId
+                    requestedBy:node.name,
+                    groupId:node.groupId
                 }
                                                                 // <-- Send a Remove command to boiler when off 
-                nlog("output to boiler:");
-                nlog(JSON.stringify(msg));
+                nlog("evaluate(): Output set payload:"+JSON.stringify(msg),"debug");
+                node.send(msg);
 
-                node.send([null,msg]);
-
+                let t=node.refTemp!==undefined ? node.refTemp : "?";
+                let sp=node.offSp!==undefined ? node.offSp : "?";
                 node.status({
                     fill:  'gray',
                     shape: 'dot',
-                    text:("Off sp: "+node.offSp+"°C, temp: "+node.refTemp+"°C")
+                    text:("Off t:"+t+"°C, sp:"+sp+"°C")
                 });
 
                 return;
             }
-            
-            phase1_Check();
-            phase1_CheckLastSeen();
-    
-            if(node.valveManualSpUpdate==true && node.allowOverride==true){             // There is a ManualUpdate directly on the valve, update all valve
-                phase2_ManualUpdate();
-                
-            }else{  // No Manual Update we can proceed to check if 
-                phase2_UpdateValve();
+              
+            // First evaluation
+            // set default values to node
+
+            if(node.firstEval == true && node.inputTrigger==false){
+                    
+                node.sp=node.requestSp;
+
             }
-    
-            phase3_UpdateExtTemperature();
-            phase4_UpdateBoiler();
-    
-            node.firstEval = false;
-            flushDataToFS();
             
-        }
+            // Manual updated detected
+            // inputTrigger== false: request is not coming from input node but from MQTT,
+            // allowOverride== true: we accept manual update on the valve
 
-        function phase1_CheckLastSeen(){
-
-        }
-
-        function phase1_Check(){
-            nlog("---------------------------------------");
-            nlog("Phase 1 - Check for Manual update on TRV");
-            nlog("---------------------------------------");
-            //node.climates.forEach((climate) => {                            // Check if Manual update occured on one of the valve
-            for ( climate of node.climates) {
-                if (climate.sp === undefined ) {
-                    node.warn("<!> climate.sp is null or empty skipping");
-                    return;
-                }
-                 
-                nlog("-->"+climate.entity);
-                nlog("   Phase 1 climate.sp:"+climate.sp);
-                nlog("   Phase 1 node.requestSp:"+node.requestSp);
-                nlog("   Phase 1 node.firstEval:"+node.firstEval);
-                nlog("   Phase 1 node.allowOverride:"+node.allowOverride);
-                nlog("   Phase 1 node.manualTrigger:"+node.manualTrigger);
-
-                if(node.firstEval == true && node.manualTrigger==false){
-                    // At startup node.requestSp==0; 
-                    // we should assign the existing sp to node.requestSP
-                    // If Smart-scheduler is wire as input node.manualTriger will be true
-    
-                    nlog("   Phase 1 first Eval node.reqestSp=climate.sp");
-                    node.requestSp=climate.sp;
-                }else if (node.manualTrigger == false && climate.sp!=node.requestSp && node.firstEval == false && node.allowOverride==true){
+            else if (node.inputTrigger == false && 
+                        node.sp!=node.requestSp && 
+                        node.firstEval == false && 
+                        node.allowOverride==true){
                     
-                    /*let now = moment();                                             // <-------- 60 s is needed for Home assistant to update
-                    let diff=now.diff(node.startTs)/1000;
-
-                    nlog("   Phase 1 diff startTs:"+diff);
-                    if (diff<60){
-                        nlog("   Phase 1 node.startTs < 60s returning");
-                        return;
-                    }*/
-
-                    let now = moment();                                             // <-------- 60 s is needed for Home assistant to update
-                    let diff=now.diff(node.lastSeen)/1000;
-                    if (diff>120){
-                        nlog("   Phase 1 !!! STRANGE !!! device is asleep for more than 2 min and still sending update ");
-                        nlog("   Phase 1 !!! STRANGE !!! device is not considered");
-                        nlog("   Phase 1 !!! STRANGE !!! Continue the loop");
-                        continue;
+                nlog("evaluate(): Manual update from the valve detected","debug");
+                if (node.noOut==false){
+                    let msg={
+                        topic:node.topic,
+                        payload:{
+                            command:"override",
+                            setpoint:node.requestSp,
+                            temperature:node.refTemp,
+                            requestedBy:node.name,
+                            groupId:node.groupId,
+                            noOut:true
+                        }
                     }
-    
-                    nlog("   Phase 1 manual update from the valve detected");
-                    node.valveManualSp=climate.sp;
-                    node.valveManualSpUpdate=true;
 
-                    nlog("   Phase 1 node.valveManualSp:"+node.valveManualSp);
-                    
-                    // Add 02/01/24
-                    nlog("   Phase 1 update lastInputTs (manual update is compare to input to avoid ping pong)")
-                    node.lastInputTs=moment();
-
-                    nlog ("   Phase 1 returning before the end of the loop as manual update found")
-                    break;
+                    nlog("evaluate(): Output override payload:"+JSON.stringify(msg),"debug");
+                    node.send([msg]);
                 }
-            }//);
-            nlog("---------------------------------------");
-            nlog("End of Phase 1");
-            nlog("---------------------------------------\n");
-        }
-
-        function phase2_ManualUpdate(){
-
-            nlog("---------------------------------------");
-            nlog("Phase 2a phase2_ManualUpdate()");
-            nlog("---------------------------------------");
-
-            nlog("   Phase 2 set node.prevSp=node.requestSp:"+node.requestSp);
-            nlog("   Phase 2 set node.requestSp=node.valveManualSp:"+node.valveManualSp);
+        
+                node.status({
+                    fill:  'yellow',
+                    shape: 'dot',
+                    text:("Manual, t:"+node.refTemp+"°C, sp:"+node.requestSp+"°C")
+                }); 
+            }
             
-            node.prevRequestSp=node.requestSp;
-            node.requestSp=node.valveManualSp;
-            
-            for ( climate of node.climates) {
-            //node.climates.forEach((climate) => {
+            // Update from the input node
+            // action is to update the valve by sending a MQTT message
 
-                let msg={};
-                msg.payload={
-                    topic: node.topic,
-                    domain:"climate",
-                    service:"set_temperature",
-                    target:{
-                        entity_id:[
-                            climate.entity
-                        ]
-                    },
-                    data:{
-                        temperature:node.valveManualSp //  We update all valve with the same Manual SP
-                    }
-                };
-                // 02/01/24 Everything by Mqtt for more simplicity
-                //node.send([msg,null]);
-
-                if (node.mqttUpdates==true && climate.valveSpTopic!=undefined && climate.valveSpTopic!=""){
-                    let mqttmsg={topic:climate.valveSpTopic,payload:parseFloat(node.valveManualSp),qos:0,retain:false};
-                    node.warn(JSON.stringify(mqttmsg));
+            else if (node.firstEval== true || 
+                (node.inputTrigger == true && node.sp!=node.requestSp) || 
+                node.spUpdateMode=="spUpdateMode.cycle"){
+                    
+                if ( node.valveSetpointSetTopic!=undefined && node.valveSetpointSetTopic!=""){
+                    let mqttmsg={topic:node.valveSetpointSetTopic,payload:parseFloat(node.requestSp),qos:0,retain:false};
                     node.mqttstack.push(mqttmsg);
                 }
-            }//);
-            sendMqtt();
-            
-            node.valveManualSpUpdate=false;
-            
-            let msg={
-                topic:node.topic,
-                payload:{
-                    command:"override",
-                    setpoint:node.valveManualSp,
-                    noout:true
+                node.sp=node.requestSp;            
+            }
+
+            // Update of the external valve temperature topic
+            if (node.valveTemperatureSetTopic === null || node.valveTemperatureSetTopic === "") {
+                nlog("evaluate(): <!>valveTemperatureSetTopic is null or empty skipping","warn");
+                return;
+            }else{
+                if (node.refTemp!=undefined && node.prevRefTemp!=node.refTemp){
+                    nlog("evaluate(): MQTT valve external_temp:"+node.refTemp,"debug");
+
+                    let mqttmsg={topic:node.valveTemperatureSetTopic,payload:parseFloat(node.refTemp),qos:0,retain:false};
+                    node.mqttstack.push(mqttmsg);
+
+                    if (node.valveTemperatureSensorTypeSetTopic!=undefined && node.valveTemperatureSensorTypeSetTopic!=""){
+                        nlog("evaluate(): MQTT temperature sensor type:"+node.valveTemperatureSensorTypePayload,"debug");
+                        let mqttmsgType={topic:node.valveTemperatureSensorTypeSetTopic,payload:node.valveTemperatureSensorTypePayload,qos:0,retain:false};
+                        node.mqttstack.push(mqttmsgType);
+                    }
+                    
+                }else{
+                    nlog("evaluate(): no update","debug");
                 }
             }
-    
-            node.send([null,msg]);
-        
-            node.status({
-                fill:  'yellow',
-                shape: 'dot',
-                text:("Manual override sp: "+node.valveManualSp+"°C, temp: "+node.refTemp+"°C")
-            }); 
-            
-            nlog("---------------------------------------");
-            nlog("End of Phase 2a");
-            nlog("---------------------------------------\n");
-        }
 
-        function phase2_UpdateValve(){
-            nlog("---------------------------------------");
-            nlog("Phase 2b phase2_UpdateValve()");
-            nlog("---------------------------------------");
-            for ( climate of node.climates) {
-            //node.climates.forEach((climate) => {
-            
-                if (climate.entity === null || climate.entity === "") {
-                    node.warn("Phase 2 climate.entity is null or empty skipping");
-                    return;
-                }
-
-                nlog("-->Phase 2:"+climate.entity);
-                nlog("   node.firstEval:"+node.firstEval);
-                nlog("   node.manualTrigger:"+node.manualTrigger);
-                nlog("   node.spUpdateMode:"+node.spUpdateMode);
-                nlog("   climate.sp:"+climate.sp);
-                nlog("   node.requestSp:"+node.requestSp);
-
-                if (climate.sp==undefined){
-                    node.warn("Phase 2 climate.sp is null or empty skipping");
-                    return;
-                }
-
-                if (node.firstEval== true || (node.manualTrigger == true && climate.sp!=node.requestSp) || node.spUpdateMode=="spUpdateMode.cycle"){
-                    nlog("   condition:");
-                    nlog("     climate.sp:"+climate.sp);
-                    nlog("     node.requestSp:"+node.requestSp);
-                    nlog("     node.firstEval:"+node.firstEval);
-                    nlog("     node.manualTrigger:"+node.manualTrigger);
-                    nlog("     node.spUpdateMode:"+node.spUpdateMode);
-
-                    
-                    
-                    /*
+            // Send to Boiler if needed
+            if (node.refTemp!=node.prevRefTemp || node.requestSp!=node.prevSp || node.firstEval==true){
+                if (node.noOut==false){
                     let msg={};
                     msg.payload={
-                        topic: node.topic,
-                        domain:"climate",
-                        service:"set_temperature",
-                        target:{
-                            entity_id:[
-                                climate.entity
-                            ]
-                        },
-                        data:{
-                            temperature:node.requestSp
-                        }
-                    };
-                    */
-
-                    climate.lastRequestSp=moment();             // we store last updateTS 
-                    //nlog("      Output msg:"+JSON.stringify(msg));
-                    
-                    // 02/01/24 Everything by Mqtt for more simplicity
-                    //node.send([msg,null]);
-
-                    if (node.mqttUpdates==true && climate.valveSpTopic!=undefined && climate.valveSpTopic!=""){
-                        nlog("     send MQTT update");
-                        let mqttmsg={topic:climate.valveSpTopic,payload:parseFloat(node.requestSp),qos:0,retain:false};
-                        node.mqttstack.push(mqttmsg);
+                        command:"set",
+                        setpoint:node.requestSp,
+                        temperature:node.refTemp,
+                        requestedBy:node.name,
+                        groupId:node.groupId
                     }
-                }
-            }//);
 
-            sendMqtt();
-
-            // Update the status in UI
-            if (/*Math.round(*/parseFloat(node.refTemp)/*)*/>parseFloat(node.requestSp)){
-                node.status({
-                    fill:  'green',
-                    shape: 'dot',
-                    text:("temp: "+/*Math.round(*/node.refTemp/*)*/+"°C, sp: "+node.requestSp+"°C")
-                });
-            }else{
-                node.status({
-                    fill:  'red',
-                    shape: 'dot',
-                    text:("temp: "+/*Math.round(*/node.refTemp/*)*/+"°C, sp: "+node.requestSp+"°C")
-                });
-            }
-    
-            node.manualTrigger = false;
-            nlog("---------------------------------------");
-            nlog("End of Phase 2b");
-            nlog("---------------------------------------\n");
-        }
-
-        function phase3_UpdateExtTemperature(){
-            nlog("---------------------------------------");
-            nlog("Phase 3 phase3_UpdateExtTemperature()");
-            nlog("---------------------------------------");
-            node.climates.forEach((climate) => {
-                nlog("-->Phase 3: phase3_UpdateExtTemperature():"+climate.entity);
-                if (climate.valveExtTempTopic === null || climate.valveExtTempTopic === "") {
-                    node.warn("   <!>climate.valveExtTempTopic is null or empty skipping");
-                    return;
-                }
-                
-                if (node.mqttUpdates==true && node.refTemp!=undefined && climate.t!=node.refTemp){
-                    nlog("   Update mqtt valve external_temp:"+node.refTemp);
-
-                    let mqttmsg={topic:climate.valveExtTempTopic,payload:parseFloat(node.refTemp),qos:0,retain:false};
-                    node.mqttstack.push(mqttmsg);
-
-                    mqttmsg={topic:climate.entityTopic+"/set/sensor",payload:"external",qos:0,retain:false};
-                    node.mqttstack.push(mqttmsg);
-                }else{
-                    nlog("   No update needed...");
-                }
-            });
-            sendMqtt();
-            nlog("---------------------------------------");
-            nlog("End of Phase 3");
-            nlog("---------------------------------------\n");
-        }
-
-        function phase4_UpdateBoiler(){
-
-            nlog("---------------------------------------");
-            nlog("Phase 4 phase4_UpdateBoiler()");
-            nlog("---------------------------------------");
-
-            
-            if (node.refTemp!=node.previousRefTemp || node.requestSp!=node.previousSp || node.firstEval==true){
-
-                let msg={};
-                msg.payload={
-                    command:"set",
-                    topic: node.topic,
-                    setpoint:node.requestSp,
-                    temperature:node.refTemp,
-                    name:node.name,
-                    groupid:node.groupId
+                    node.send([msg]);
+                    nlog("evaluate(): Output set payload:"+JSON.stringify(msg),"debug");
                 }
 
-                node.send([null,msg]);
-
-                nlog("  sp:"+node.requestSp);
-                nlog("  temp:"+node.refTemp);
-                nlog("  name:"+node.name);
-                nlog("  id:"+node.groupId);
-
-                node.previousRefTemp=node.refTemp;
+                node.prevRefTemp=node.refTemp;
                 node.prevSp=node.requestSp;
 
             }else{
-                nlog("  no update...");
+                nlog("evaluate(): no output to boiler","debug");
             }
-            nlog("---------------------------------------");
-            nlog("End of Phase 4");
-            nlog("---------------------------------------\n");
-        }
-
-        node.startTs=moment();
-        node.warn("<!> nodeid:"+node.id);
-        //unlinkFs();
-        loadDataFromFs();
         
-        node.mqttUpdates=true;
-        if (node.mqttUpdates==true && node.mqttSettings && node.mqttSettings.mqttHost){
+            // At the very end we flush MQTT messages
+            
+            sendMqtt();
+
+            node.firstEval=false;
+            node.inputTrigger=false;
+            node.noOut=false;
+        }       
+
+        
+        if ( node.mqttSettings && node.mqttSettings.mqttHost){
             
             const protocol = 'mqtt'
             const host = node.mqttSettings.mqttHost
@@ -773,7 +536,7 @@ module.exports = function(RED) {
         }
 
         node.on('close', function() {
-            nlog("closing connexion");
+            nlog("MQTT closing connexion");
             node.log('MQTT disconnecting');
             clearInterval(node.evalInterval);
             node.mqttclient.end();

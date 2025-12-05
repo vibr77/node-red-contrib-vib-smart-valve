@@ -1,79 +1,94 @@
-# Smart-valve 
-    
-The purpose of this project was to replace at my house the existing NETATMO system (very good but not integrated in Home assistant and with no repeater).
+# Smart-Valve Node
 
-I have a boiler with Opentherm Card and a dedicated dev with ESP32 https://github.com/vibr77/Opentherm_HA_MQTT
+The `smart-valve` node is designed to manage heating valves (TRVs) in a Node-RED environment, specifically tailored for Home Assistant and MQTT integration. It allows grouping multiple valves in a single room, handling external temperature sensors, and managing manual overrides.
 
+## Features
 
-Changelog 20240102:
-- Add a mecanism for manual update on the TRV (wip)
+*   **Multi-Valve Management**: Group multiple TRVs to operate as a single zone.
+*   **External Temperature Reference**: Use an external temperature sensor for more accurate room temperature readings.
+*   **MQTT Integration**: Extensive use of MQTT for receiving status and sending commands.
+*   **Manual Override Detection**: Detects if a valve's setpoint is changed manually and updates other valves in the group.
+*   **Boiler Integration**: Sends demand signals to a `smart-boiler` node.
+*   **Auto-Calibration**: (Optional) Adjusts valve temperature based on external sensor (if supported).
 
-Changelog 20231031: 
-- Fixe BRT-100-TRV firmware issue (TRV wrong position stay at 25% open position) with a work around on current temperature
+## Configuration
 
-Smart-Valce is part of a suite of nodes to manage multi room heating system based on TRV and boiler
-- Smart-Scheduler: multi-zonning SmartScheduler,
-- Smart-Valve: Valve grouping, auto-calibration, manual override,
-- Smart-Boiler: Boiler OpenTherm, multi valve management.
+### General
+*   **Name**: Node name, also used as the group name for the boiler.
+*   **Topic**: MQTT topic (optional/informational).
+*   **MQTT Settings**: Reference to a global MQTT configuration node.
+*   **Group ID**: Unique integer ID for the valve group (required for `smart-boiler`).
 
-## Smart-valve
+### Temperature Settings
+*   **Temperature Entity**: Name of the external temperature sensor entity (e.g., `sensor.living_room_temp`).
+*   **Temperature Topic**: MQTT topic for the external temperature sensor.
+*   **Off Setpoint**: Temperature setpoint when the valve is turned "Off" (e.g., 5°C for frost protection).
 
- This node enables to manage multiple valve (climate) in a same room like one. 
- It support the following features :
- - External temperature sensor,
- - Multiple valves updates,
- - TRV temperture Recalibration based on the external temperature sensor,
- - Manual update directly on the valve to trigger override message to the scheduler and update the other valve
+### Climates (Valves)
+Define each valve controlled by this node:
+*   **Climate Entity**: Home Assistant entity ID (e.g., `climate.radiator_1`).
+*   **Ext Temp Topic**: MQTT topic to publish external temperature to the valve (for TRVs that support it).
+*   **Entity Topic**: MQTT topic to receive status updates from the valve.
+*   **SetPoint Topic**: MQTT topic to send setpoint commands to the valve.
 
-### Key Features:
-- TRV auto calibration with an external source
-- Detection of manual update direcly on TRV
-- Fixe BRT-100-TRV issue on valve postion that stay open
-- Multi valves in the same room management
-- Multi mode execution Off / auto / Manual
-- Multi trigger execution: every cycle, at startup, on change.
+### Advanced
+*   **Update Mode**:
+    *   `when state changes`: Send updates only when values change.
+    *   `when state changes + startup`: Send updates on change and node startup.
+    *   `every cycle`: Send updates every cycle regardless of changes.
+*   **Update Cycle**: Duration in minutes between evaluation cycles (default: 5).
+*   **Allow Manual Update**: If enabled, manual changes on a TRV will propagate to others and override the schedule.
+*   **Recalibration**: Option to adjust valve temperature offset (requires specific TRV support).
+*   **Debug**: Enable verbose logging to the Node-RED console.
 
+## Inputs
 
+The node accepts messages to control its state:
 
-### Inputs
-    
- - payload (string):[1|on|trigger]
- - sp (integer): [0-35]    
- 
- ## Outputs
- 
- 1. Update home assistant via call service
- 
- 2. Update of SP to the boiler (smart-Boiler) or override message to the smart-scheduler
-    
-### Settings
+*   **Command**: `msg.payload.command`
+    *   `on` / `1`: Turn the node ON (Auto mode).
+    *   `off` / `0`: Turn the node OFF (Frost protection mode).
+    *   `set` / `trigger`: Set a specific setpoint. Requires `msg.payload.setpoint`.
+*   **Setpoint**: `msg.payload.setpoint` (Number) - Target temperature (required for `set` command).
 
-- Name: [string], name of the node and also the name of the group sent to the smart-boiler node
-- Topic: [string], not used,
-- Group Id: [integer], used by the smart-boiler node to identify this group of valves, need to be unique
+Example `msg.payload`:
+```json
+{
+    "command": "set",
+    "setpoint": 21.5
+}
+```
 
-- Temperature: [string], is the name of the external temperature sensor entity in home assistant ex: sensor.temp9
-- Update mode: [state changed|state changed+startup|every cycle], define how frequently updates are sent to the smart-boiler node
-- Update cycle: [integer], duration in minute between two cycle. default is 5
-- Allow manual updates: [true|false], enable direct set point (target temperature) change on the valve or home assistant. If true when a valve set point ischanged all the other valves are updated and a override message is sent to the smart-scheduler node.
-- Recalibration: [No|Yes|Yes+threshold], enable to adjust the valve (TRV) current temperature based on the external temperature sensor,
-- Delta threshold: [integer] [0-9], threshold delta between external temperature sensor and the TRV current temperature to trigger recalibration,
-- Debug: [true|false], send debug info to the node-red console
-- Climate: each valve entry has 2 field:
-     - climate: [string], home assitant climate entity of the valve ex: climate.kitchen
-     - calibration: [string], home assistant calibration entity of the valve ex: number.kitchen_calibration
-    
-### Execution rules 
-- Step 0: update current group setpoint with the sp of the valve,
-- Cycle :
-    Step 1: identify if manual updates on valve, then update all valves,
-    Step 2: check and execute recalibration
-    Step 3: based on the execution mode, output to the smart-boiler node
-- On input: 
-    Update the requested set-point on each valves
+## Outputs
 
+1.  **Home Assistant / MQTT**: (Deprecated/Internal) Used for direct service calls or debugging.
+2.  **Boiler / Scheduler**: Sends status updates to `smart-boiler` or `smart-scheduler`.
+    *   `msg.payload` contains: `command`, `topic`, `setpoint`, `temperature`, `name`, `groupid`.
 
+## MQTT Topics
 
+The node subscribes to:
+*   `Temperature Topic`: To get the reference room temperature.
+*   `Entity Topic` (for each climate): To get current TRV status (setpoint, local temp).
+
+The node publishes to:
+*   `SetPoint Topic` (for each climate): To set the target temperature.
+*   `Ext Temp Topic` (for each climate): To push external temperature reference to TRVs.
+
+## Logic
+
+1.  **Initialization**: Connects to MQTT, subscribes to topics, loads last state from file.
+2.  **Cycle (Every x minutes)**:
+    *   **Phase 1 (Check)**: Checks if any valve was manually adjusted (if allowed).
+    *   **Phase 2 (Update)**:
+        *   If manual update detected: Syncs all other valves to the new setpoint.
+        *   If no manual update: Enforces the requested setpoint (from input/schedule).
+    *   **Phase 3 (Ext Temp)**: Updates TRVs with external temperature reading.
+    *   **Phase 4 (Boiler)**: Sends current demand (setpoint vs current temp) to the boiler node.
+
+---
+*Author: Vincent BESSON*
+*License: Creative Commons*
 
 <a href="https://www.buymeacoffee.com/vincentbe" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" style="height: 60px !important;width: 217px !important;" ></a>
 
