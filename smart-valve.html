@@ -22,6 +22,16 @@
             valveModeStateTopic: {value:"",required: true},
             valveModeSetTopic: {value:"",required: true},
             valveModeKey: {value:"",required: true},
+            OverrideDuration: {value:"60",required: true,validate:function(v) {
+                if (isNaN(v)){
+                    return false;
+                }
+
+                if (v<1 || v> 1440){
+                    return false;
+                }
+                return true;
+            }},
 
             valveTemperatureSensorTypeSetTopic: {value:"",required: false},
             valveTemperatureSensorTypePayload: {value:"",required: false},
@@ -133,7 +143,7 @@
     </div>
 
     <div class="form-row">
-        <label for="node-input-topic"><i class="fa fa-tasks"></i>Group id</label>
+        <label for="node-input-groupId"><i class="fa fa-tasks"></i>Group id</label>
         <input type="text" id="node-input-groupId" placeholder="id"></input>
     </div>
 
@@ -175,7 +185,7 @@
     
     <div class="form-row">
         <label for="node-input-valveTemperatureTopic">Set</label>
-        <input type="text" id="node-input-valveTemperatureTopic" placeholder="mqtt topic"></input>
+        <input type="text" id="node-input-valveTemperatureSetTopic" placeholder="mqtt topic"></input>
     </div>
 
      <div class="form-row">
@@ -240,6 +250,11 @@
     <div class="form-row">      
         <label for="node-input-allowOverride"><i class="fa fa-chain-broken">&nbsp;</i>Manual valve</label>
         <input type="checkbox" title="allow override mode" id="node-input-allowOverride"></input>
+    </div>
+    <div class="form-row">      
+        <label for="node-input-OverrideDuration"><i class="fa fa-chain-broken">&nbsp;</i>Manual </label>
+        <input type="text" title="storm Message limit" style="width:60px !important; text-align: right;" id="node-input-OverrideDuration"></input>
+        <span>min duration</span>
     </div>
 
     <div class="form-row">      
@@ -380,7 +395,7 @@
             noOut:          [boolen]                                         // trigger after evaluation output message ?
     }</code></pre>
 
-    <br>>
+    <br>
     <h5> MESSAGE INPUT/OUTPUT PARAM DESCRIPTION</h5>
 
      <table border="1" cellpadding="5" cellspacing="0" style="border-collapse: collapse; width: 100%;">
@@ -395,7 +410,7 @@
         <tbody>
            <tr>
                 <td>Command</td>
-                <td>[string],manatory</td>
+                <td>[string],mandatory</td>
                  <td>[1|set|on|0|off|trigger|override] </td>
                 <td>
                     <ul>
@@ -411,7 +426,7 @@
             </tr>
             <tr>
                 <td>setpoint</td>
-                <td>[number],manatory</td>
+                <td>[number],mandatory</td>
                 <td>[0,40]</td>
                 <td>set point temperature for input and output message</td>
             </tr>
@@ -429,9 +444,9 @@
             </tr>
             <tr>
                 <td>groupId</td>
-                <td>[number],manatory</td>
+                <td>[number],mandatory</td>
                 <td>any</td>
-                <td>Groupid of valve regoupped in the same location or linke together, ex: 3 valves in the same room should have the same groupId to be updated together </td>
+                <td>Groupid of valve regrouped in the same location or linked together, ex: 3 valves in the same room should have the same groupId to be updated together </td>
             </tr>
             <tr>
                 <td>noOut</td>
@@ -463,12 +478,10 @@
             <tr><td>Name</td><td>Unique identifier of the valve, and used for the boiler to build an array of unique entries</td></tr>
             <tr><td>MQTT</td><td>MQTT broker connection configuration</td></tr>
             <tr><td>Group Id</td><td>Unique identifier (0-100) for this valve group</td></tr>
-            <tr><td>Temperature sensor</td><td>MQTT topic for external temperature sensor, this kind be set to a specific valve temperature sensor as a master or using an external sensor for more accuracy, the [topic] is the MQTT topic, [key] is the value template.</td></tr>
+            <tr><td>Temperature sensor</td><td>MQTT topic for external temperature sensor, this can be set to a specific valve temperature sensor as a master or using an external sensor for more accuracy, the [topic] is the MQTT topic, [key] is the value template.</td></tr>
             <tr><td>Valve set point</td><td>MQTT topics to read and write setpoint,[state] is to read the set point value with value template, [set] is to write the set point, [key] is the value template.</td></tr>
-            <tr><td>Valve mode</td>Current mode of the valve [heat|off], this is linked with home assistant climate current mode<td>            
-            </td></tr>
-            <tr><td>Valve Sensor Internal/External</td>Some valve manufacturer requires a specific MQTT message to use external sensor (such as aqara), this enable a MQTT topic with a specific payload<td>            
-            </td></tr>
+            <tr><td>Valve mode</td><td>Current mode of the valve [heat|off], this is linked with home assistant climate current mode</td></tr>
+            <tr><td>Valve Sensor Internal/External</td><td>Some valve manufacturer requires a specific MQTT message to use external sensor (such as aqara), this enable a MQTT topic with a specific payload</td></tr>
             <tr><td>Off setpoint</td><td>Temperature threshold (0-35°C) for "off" state</td></tr>
             <tr><td>Update mode</td><td>Trigger condition for updates (state change, startup, cycle)</td></tr>
             <tr><td>Update cycle</td><td>Duration in minutes between cycles</td></tr>
@@ -480,7 +493,7 @@
 
     <h3>OPERATION:</h3>
     <h4>Initialization:</h4>
-    <p>By default the valve is <b>not ready</b> and needs to be intialized with valve current temperature and set point.
+    <p>By default the valve is <b>not ready</b> and needs to be initialized with valve current temperature and set point.
     The current temperature is coming either from MQTT or INPUT messages, set point can be coming either from MQTT or INPUT message </p>
 
     <h4>Cycle Execution:</h4>
@@ -495,11 +508,26 @@
         <li>Sends output message to smart-boiler/scheduler/valve set/overrride</li>
     </ul>
 
+    <h3>BUSINESS RULES:</h3>
+    <h4>Valve Activation Condition:</h4>
+    <p>A valve is considered <strong>ACTIVE</strong> (heating required) when:</p>
+    <pre><code>setpoint > temperature</code></pre>
+    <p>This means heating is requested when the target temperature exceeds the current room temperature.</p>
+    
+    <h4>Target Conditions on Input:</h4>
+    <ul>
+        <li><strong>Command "set" or "on":</strong> Valve processes input if <code>executionMode = true</code></li>
+        <li><strong>Command "trigger" or "1":</strong> Only triggers evaluation if <code>executionMode = true</code></li>
+        <li><strong>Command "override":</strong> Always processed regardless of executionMode, forces setpoint update across all valves in group</li>
+        <li><strong>Command "off" or "0":</strong> Sets <code>executionMode = false</code>, disables valve operation</li>
+    </ul>
+
     <h3>NOTES:</h3>
     <ul>
         <li>Each valve group requires a unique Group Id</li>
         <li>External temperature sensor improves accuracy for multi-valve rooms</li>
         <li>Manual override allows integration with physical valve controls</li>
+        <li><strong>State Persistence:</strong> The node automatically saves setpoint and temperature values to <code>~/.node-red/.node-red-state/valve-{node-id}.json</code>. This state is restored on Node-RED restarts and flow redeployments, ensuring valve settings persist across all system changes.</li>
     </ul>
 </script>
 

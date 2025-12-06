@@ -78,6 +78,13 @@ module.exports = function(RED) {
         this.debugInfo=n.debugInfo? n.debugInfo :"debug";                                                 // debug verbose to the console
         this.msgStormInterval=10000; // 10 seconde
         this.msgStormLastTs=0;
+        
+        this.inputLastTs=0;
+        this.inputMaxInterval=10000; // 10 secondes
+        
+        this.overrideStartTs=0;
+        this.overrideMode=false;
+        this.overrideDuration=n.overrideDuration ? parseInt(n.overrideDuration): 60; // in minutes
         var node = this;
         
         /*function getRandomInt(min,max) {
@@ -111,6 +118,64 @@ module.exports = function(RED) {
             }
         }
 
+        function saveState() {
+            const state = {
+                requestSp: node.requestSp,
+                sp: node.sp,
+                refTemp: node.refTemp,
+                timestamp: Date.now()
+            };
+            
+            // Save to both context (for backward compatibility) and file system
+            node.context().set("valveState", state);
+            
+            // Save to file for persistence across deploys
+            const stateDir = path.join(RED.settings.userDir, '.node-red-state');
+            const stateFile = path.join(stateDir, `valve-${node.id}.json`);
+            
+            try {
+                if (!fs.existsSync(stateDir)) {
+                    fs.mkdirSync(stateDir, { recursive: true });
+                }
+                fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
+                nlog("State saved to file: sp=" + node.sp + ", refTemp=" + node.refTemp, "debug");
+            } catch (err) {
+                nlog("Error saving state to file: " + err.message, "error");
+            }
+        }
+
+        // Load saved state at startup (after nlog and saveState are defined)
+        let savedState = null;
+        
+        // Try to load from file first (persists across deploys)
+        const stateDir = path.join(RED.settings.userDir, '.node-red-state');
+        const stateFile = path.join(stateDir, `valve-${node.id}.json`);
+        
+        try {
+            if (fs.existsSync(stateFile)) {
+                const fileData = fs.readFileSync(stateFile, 'utf8');
+                savedState = JSON.parse(fileData);
+                nlog("Loaded state from file", "info");
+            }
+        } catch (err) {
+            nlog("Error loading state from file: " + err.message, "warn");
+        }
+        
+        // Fallback to context storage if file doesn't exist
+        if (!savedState) {
+            savedState = node.context().get("valveState");
+            if (savedState) {
+                nlog("Loaded state from context", "info");
+            }
+        }
+        
+        if (savedState) {
+            node.requestSp = savedState.requestSp;
+            node.sp = savedState.sp;
+            node.refTemp = savedState.refTemp;
+            nlog("Loaded saved state: sp=" + node.sp + ", refTemp=" + node.refTemp, "info");
+        }
+
         this.ev=function(){
             node.inputTrigger=true;
             evaluate();
@@ -138,7 +203,7 @@ module.exports = function(RED) {
         }
 
         function callbackMqtt(topic,p){
-            flgProcess=false;
+            let flgProcess=false;
             if (topic==node.temperatureSensorStateTopic){
 
                 if (p[node.temperatureSensorKey]===undefined){
@@ -174,7 +239,7 @@ module.exports = function(RED) {
                 }
             }
             
-            if (topic==node.valveModeTopic){
+            if (topic==node.valveModeStateTopic){
                 if (p[node.valveModeKey]===undefined){
                     nlog(`MQTT Invalid payload key:${node.valveModeKey}, topic:${topic}`,"warn");
                     return;
@@ -203,6 +268,10 @@ module.exports = function(RED) {
 
             if (flgProcess==true){
                 nlog("flgProcess sp/refTemp changed-> trigger evaluate();","debug");
+                if (moment().valueOf()-node.inputLastTs<node.inputMaxInterval){
+                    nlog("callbackMqtt(): inputLastTs within inputMaxInterval, skipping evaluate() to avoid storm","warn");
+                    return;
+                }
                 evaluate();
                 flgProcess=false;
             }else{
@@ -240,10 +309,15 @@ module.exports = function(RED) {
                 return;
             }
 
+            if (node.overrideStartTs>0 && node.overrideMode==true && moment().valueOf()-node.overrideStartTs>(node.overrideDuration*60000)){
+                nlog("Override duration expired, exiting override mode","info");
+                node.overrideMode=false;
+            }
+
             let command=msg.payload.command;
-            if (command !==undefined && command.match(/^(1|set|on|0|off|trigger|override)$/i)) {
+            if (command !==undefined && command.match(/^(1|set|on|auto|0|off|trigger|override)$/i)) {
                 
-                if (command == '1' || command== 'trigger' || command == 'on' || command == 'set' || command=='override'){
+                if (command == '1' || command== 'trigger' || command=="auto" || command == 'on' || command == 'set' || command=='override'){
                     
                     if (command=='on'){
                         node.executionMode=true;
@@ -253,16 +327,38 @@ module.exports = function(RED) {
                         
                     }
 
+                    else if (command=='auto'){
+                        node.executionMode=true;
+                        node.overrideMode=false;
+                    }
+
                     else if (command=='set' || command=='override'){
 
-                        if (command=="set" && msg.payload.setpoint=== undefined || isNaN(msg.payload.setpoint) || parseFloat(msg.payload.setpoint)<0 || parseFloat(msg.payload.setpoint)>40){ //<----------- Todo define Max & Min in config
+                        if (command=='set' && node.overrideMode==true){
+                            nlog("In override mode, 'set' command ignored","info");
+                            return;
+                        }
+
+                        if (command=='set' && msg.payload.target!==undefined && msg.payload.target=="boiler"){
+                            nlog("Command 'set' for target 'boiler' -> ignoring","debug");
+                            return;
+                        }
+
+                        if (command=="set" && (msg.payload.setpoint=== undefined || isNaN(msg.payload.setpoint) || parseFloat(msg.payload.setpoint)<0 || parseFloat(msg.payload.setpoint)>40)){ //<----------- Todo define Max & Min in config
                             nlog('received trigger missing or invalid msg.sp number',"error");
+                            return;
+                        }
+
+                        if (command=="override" && (msg.payload.setpoint=== undefined || isNaN(msg.payload.setpoint) || parseFloat(msg.payload.setpoint)<0 || parseFloat(msg.payload.setpoint)>40)){
+                            nlog('Command:override missing or invalid msg.setpoint number',"error");
                             return;
                         }
 
                         if (command=="override" && node.allowOverride==true && node.executionMode==true && msg.payload.requestedBy!==undefined && msg.payload.groupId!==undefined){
                             if (msg.payload.requestedBy!=node.name && msg.payload.groupId==node.groupId){
                                 nlog("Command:override, requestedBy:"+msg.payload.requestedBy+" != node.name:"+node.name+" -> process override","debug")
+                                node.overrideStartTs=moment().valueOf();
+                                node.overrideMode=true;
                             }else{
                                 nlog("Command:override, requestedBy:"+msg.payload.requestedBy+" == node.name:"+node.name+" || node.groupId!="+msg.payload.groupId+" -> ignoring own override","debug")
                                 return;
@@ -276,12 +372,14 @@ module.exports = function(RED) {
                         }
 
                         if (msg.payload.temperature=== undefined || isNaN(msg.payload.temperature) || parseFloat(msg.payload.temperature)<0 || parseFloat(msg.payload.temperature)>40){
-                            
+                            // Temperature not provided or invalid - will use existing refTemp or MQTT value
+                            nlog("Temperature not provided in input, using existing value","debug");
                         }else{
-                            node.refTemp=parseFloat(msg.payload.temperature).toFixed(2);
+                            node.refTemp=parseFloat(msg.payload.temperature);
                         }
 
-                        node.requestSp=parseFloat(msg.payload.setpoint).toFixed(2);
+                        // Update requestSp for both 'set' and 'override' commands after validation
+                        node.requestSp=parseFloat(msg.payload.setpoint);
                        
                     }
 
@@ -298,11 +396,11 @@ module.exports = function(RED) {
                 nlog("msg:"+JSON.stringify(msg.payload),"debug");
 
                 nlog(`Command:${command}, sp:${node.requestSp}, noOut:${node.noOut},inputTrigger:${node.inputTrigger}, executionMode:${node.executionMode}`,"debug");
-                                                       
+                node.inputLastTs=moment().valueOf();                                     
                 evaluate();
 
             } else 
-                nlog('evaluate(): unhandled msg.payload:'+JSON(msg.payload),"debug");
+                nlog('evaluate(): unhandled msg.payload:'+JSON.stringify(msg.payload),"debug");
         });
 
         function evaluate() {
@@ -320,6 +418,18 @@ module.exports = function(RED) {
                 nlog(`evaluate(): <!> Message storm detected: ${node.msgStormMsgCounter} messages within ${node.msgStormInterval/1000}s, evaluate() aborted!`,"error");
                 return;
             }
+            let overrideTextStatus="";
+            if (node.overrideMode==true){
+                if (moment().valueOf()-node.overrideStartTs>(node.overrideDuration*60000)){
+                    nlog("evaluate(): Override duration expired, exiting override mode","info");
+                    node.overrideMode=false;
+                }else{
+                    let manualMinLeft=Math.ceil((node.overrideStartTs+(node.overrideDuration*60000)-moment().valueOf())/60000);
+                    overrideTextStatus=`(Manual ${manualMinLeft}min left),`;
+                    //nlog("evaluate(): In override mode, skipping evaluate()","info");
+                    //return;
+                }
+            }
         
             if (node.refTemp===undefined || node.requestSp===undefined /*|| node.sp===undefined*/){
                 nlog("evaluate(): node.refTemp or node.requestSp is undefined returning","debug");
@@ -329,7 +439,7 @@ module.exports = function(RED) {
                 node.status({
                     fill: 'yellow',
                     shape:'dot',
-                    text:("Not ready t:"+t+"°C, sp:"+sp+"°C")
+                    text:(overrideTextStatus+" Not ready t:"+t+"°C, sp:"+sp+"°C")
                 });
 
                 return;
@@ -339,13 +449,13 @@ module.exports = function(RED) {
                     node.status({
                         fill:  'green',
                         shape: 'dot',
-                        text:("idle t:"+node.refTemp+"°C, sp:"+node.requestSp+"°C")
+                        text:(overrideTextStatus+" idle t:"+node.refTemp+"°C, sp:"+node.requestSp+"°C")
                     });
                 }else{
                     node.status({
                         fill:  'red',
                         shape: 'dot',
-                        text:("Heat t:"+node.refTemp+"°C, sp:"+node.requestSp+"°C")
+                        text:(overrideTextStatus+" Heat t:"+node.refTemp+"°C, sp:"+node.requestSp+"°C")
                     });
                 }
             }
@@ -360,9 +470,10 @@ module.exports = function(RED) {
                 let msg={};
                 msg.payload={
                     command:"set",
+                    target:"boiler",
                     topic: node.topic,
-                    setpoint:node.offSp,
-                    temperature:node.refTemp,
+                    setpoint:parseFloat(node.offSp).toFixed(2),
+                    temperature:parseFloat(node.refTemp).toFixed(2),
                     requestedBy:node.name,
                     groupId:node.groupId
                 }
@@ -370,8 +481,8 @@ module.exports = function(RED) {
                 nlog("evaluate(): Output set payload:"+JSON.stringify(msg),"debug");
                 node.send(msg);
 
-                let t=node.refTemp!==undefined ? node.refTemp : "?";
-                let sp=node.offSp!==undefined ? node.offSp : "?";
+                let t=node.refTemp!==undefined ? parseFloat(node.refTemp).toFixed(2) : "?";
+                let sp=node.offSp!==undefined ? parseFloat(node.offSp).toFixed(2) : "?";
                 node.status({
                     fill:  'gray',
                     shape: 'dot',
@@ -405,8 +516,8 @@ module.exports = function(RED) {
                         topic:node.topic,
                         payload:{
                             command:"override",
-                            setpoint:node.requestSp,
-                            temperature:node.refTemp,
+                            setpoint:parseFloat(parseFloat(node.requestSp).toFixed(2)),
+                            temperature:parseFloat(parseFloat(node.refTemp).toFixed(2)),
                             requestedBy:node.name,
                             groupId:node.groupId,
                             noOut:true
@@ -416,11 +527,14 @@ module.exports = function(RED) {
                     nlog("evaluate(): Output override payload:"+JSON.stringify(msg),"debug");
                     node.send([msg]);
                 }
-        
+                node.overrideMode=true;
+                node.overrideStartTs=moment().valueOf();
+                node.sp=node.requestSp;  // Update sp to match the manual change
+
                 node.status({
                     fill:  'yellow',
                     shape: 'dot',
-                    text:("Manual, t:"+node.refTemp+"°C, sp:"+node.requestSp+"°C")
+                    text:("Manual t:"+parseFloat(node.refTemp).toFixed(2)+"°C, sp:"+parseFloat(node.requestSp).toFixed(2)+"°C")
                 }); 
             }
             
@@ -432,7 +546,7 @@ module.exports = function(RED) {
                 node.spUpdateMode=="spUpdateMode.cycle"){
                     
                 if ( node.valveSetpointSetTopic!=undefined && node.valveSetpointSetTopic!=""){
-                    let mqttmsg={topic:node.valveSetpointSetTopic,payload:parseFloat(node.requestSp),qos:0,retain:false};
+                    let mqttmsg={topic:node.valveSetpointSetTopic,payload:parseFloat(parseFloat(node.requestSp).toFixed(2)),qos:0,retain:false};
                     node.mqttstack.push(mqttmsg);
                 }
                 node.sp=node.requestSp;            
@@ -440,13 +554,13 @@ module.exports = function(RED) {
 
             // Update of the external valve temperature topic
             if (node.valveTemperatureSetTopic === null || node.valveTemperatureSetTopic === "") {
-                nlog("evaluate(): <!>valveTemperatureSetTopic is null or empty skipping","warn");
-                return;
+                nlog("evaluate(): <!>valveTemperatureSetTopic is null or empty, skipping valve temp update","warn");
+                // Don't return - continue to send updates to boiler
             }else{
                 if (node.refTemp!=undefined && node.prevRefTemp!=node.refTemp){
                     nlog("evaluate(): MQTT valve external_temp:"+node.refTemp,"debug");
 
-                    let mqttmsg={topic:node.valveTemperatureSetTopic,payload:parseFloat(node.refTemp),qos:0,retain:false};
+                    let mqttmsg={topic:node.valveTemperatureSetTopic,payload:parseFloat(parseFloat(node.refTemp).toFixed(2)),qos:0,retain:false};
                     node.mqttstack.push(mqttmsg);
 
                     if (node.valveTemperatureSensorTypeSetTopic!=undefined && node.valveTemperatureSensorTypeSetTopic!=""){
@@ -466,8 +580,9 @@ module.exports = function(RED) {
                     let msg={};
                     msg.payload={
                         command:"set",
-                        setpoint:node.requestSp,
-                        temperature:node.refTemp,
+                        target:"boiler",
+                        setpoint:parseFloat(node.requestSp).toFixed(2),
+                        temperature:parseFloat(node.refTemp).toFixed(2),
                         requestedBy:node.name,
                         groupId:node.groupId
                     }
@@ -486,6 +601,9 @@ module.exports = function(RED) {
             // At the very end we flush MQTT messages
             
             sendMqtt();
+
+            // Save state after successful evaluation
+            saveState();
 
             node.firstEval=false;
             node.inputTrigger=false;
@@ -535,11 +653,13 @@ module.exports = function(RED) {
             setTimeout(evaluate, 1000)
         }
 
-        node.on('close', function() {
+        node.on('close', function(done) {
             nlog("MQTT closing connexion");
             node.log('MQTT disconnecting');
             clearInterval(node.evalInterval);
-            node.mqttclient.end();
+            if (node.mqttclient) {
+                node.mqttclient.end();
+            }
             done();
 
         })

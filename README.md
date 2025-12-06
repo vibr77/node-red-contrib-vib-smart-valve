@@ -10,6 +10,7 @@ The `smart-valve` node is designed to manage heating valves (TRVs) in a Node-RED
 *   **Manual Override Detection**: Detects if a valve's setpoint is changed manually and updates other valves in the group.
 *   **Boiler Integration**: Sends demand signals to a `smart-boiler` node.
 *   **Auto-Calibration**: (Optional) Adjusts valve temperature based on external sensor (if supported).
+*   **State Persistence**: Automatically saves and restores setpoint and temperature values across Node-RED restarts and flow deploys.
 
 ## Configuration
 
@@ -59,6 +60,23 @@ Example `msg.payload`:
 }
 ```
 
+## Business Rules
+
+### Valve Activation Condition
+A valve is considered **ACTIVE** (heating required) when:
+```
+setpoint > temperature
+```
+This means heating is requested when the target temperature exceeds the current room temperature.
+
+### Target Conditions on Input
+*   **Command "set" or "on"**: Valve processes input if `executionMode = true`
+*   **Command "trigger" or "1"**: Only triggers evaluation if `executionMode = true`
+*   **Command "override"**: Always processed regardless of executionMode, forces setpoint update across all valves in group
+*   **Command "off" or "0"**: Sets `executionMode = false`, disables valve operation
+*   **GroupId matching**: Input messages only processed if `msg.payload.groupId` matches the node's configured Group ID
+*   **Manual override propagation**: When manual update is detected on one valve, all valves in the same group are synchronized to the new setpoint
+
 ## Outputs
 
 1.  **Home Assistant / MQTT**: (Deprecated/Internal) Used for direct service calls or debugging.
@@ -77,7 +95,10 @@ The node publishes to:
 
 ## Logic
 
-1.  **Initialization**: Connects to MQTT, subscribes to topics, loads last state from file.
+1.  **Initialization**: 
+    *   Connects to MQTT and subscribes to topics.
+    *   Loads last saved state from file system (`.node-red-state/valve-{node-id}.json`).
+    *   Restores previous setpoint and temperature values if available.
 2.  **Cycle (Every x minutes)**:
     *   **Phase 1 (Check)**: Checks if any valve was manually adjusted (if allowed).
     *   **Phase 2 (Update)**:
@@ -85,6 +106,23 @@ The node publishes to:
         *   If no manual update: Enforces the requested setpoint (from input/schedule).
     *   **Phase 3 (Ext Temp)**: Updates TRVs with external temperature reading.
     *   **Phase 4 (Boiler)**: Sends current demand (setpoint vs current temp) to the boiler node.
+    *   **Phase 5 (Persistence)**: Saves current state to file for persistence across restarts.
+
+## State Persistence
+
+The node automatically saves its state to the file system at `~/.node-red/.node-red-state/valve-{node-id}.json`. This includes:
+
+*   **requestSp**: Requested setpoint
+*   **sp**: Current setpoint
+*   **refTemp**: Reference temperature from external sensor
+*   **timestamp**: Last save timestamp
+
+This state is automatically restored when:
+*   Node-RED restarts
+*   Flows are redeployed
+*   Node is reinitialized
+
+The state file persists independently of Node-RED's context storage, ensuring valve settings are preserved even after complete system restarts.
 
 ---
 *Author: Vincent BESSON*
