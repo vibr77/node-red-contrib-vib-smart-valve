@@ -46,6 +46,7 @@ function settledRoom(name, o = {}) {
 }
 
 describe('smart-valve 0.82', function () {
+    this.timeout(60000);      // long simulated periods (12 h, 25 h) on a fake clock; slow disks need more than 2 s
     beforeEach(function () {
         clock = sinon.useFakeTimers({ now: START, toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });
         H.resetBroker();
