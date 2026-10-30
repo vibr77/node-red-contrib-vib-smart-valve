@@ -7,6 +7,8 @@
         mqttPort:{value: '1883', required: true},
         mqttUser:{value: '', required: false},
         mqttRootPath:{value: 'homeassistant', required: true},
+        haDiscovery:{value: false},
+        haBaseTopic:{value: 'smartheating', required: false},
       },
       credentials: {
         mqttPassword: {type: "password"}
@@ -16,6 +18,8 @@
       },
       oneditprepare: function () {
         var node = this
+        // 0.82: configuration nodes saved by an older version have no State topic yet
+        if (!node.haBaseTopic) { $("#node-config-input-haBaseTopic").val('smartheating'); }
         
         $("#node-config-input-test-connection").on("click", function(e) {
             e.preventDefault();
@@ -90,6 +94,15 @@
       <label for="node-config-input-mqttRootPath"><i class="icon-globe"></i> Root path</label>
       <input type="text" id="node-config-input-mqttRootPath">
     </div>
+    <div class="form-row">
+      <label for="node-config-input-haDiscovery"><i class="fa fa-home"></i> HA discovery</label>
+      <input type="checkbox" id="node-config-input-haDiscovery" style="width:auto;">
+      <span>publish health entities to Home Assistant (discovery prefix = Root path)</span>
+    </div>
+    <div class="form-row">
+      <label for="node-config-input-haBaseTopic"><i class="fa fa-home"></i> State topic</label>
+      <input type="text" id="node-config-input-haBaseTopic" placeholder="smartheating">
+    </div>
      <div class="form-row">
       <a href="#" class="editor-button" id="node-config-input-test-connection" style="margin-top: 4px;"><i class="fa fa-refresh"></i> Test Connection</a>
       <span id="test-connection-result" style="margin-left: 10px;"></span>
@@ -99,7 +112,11 @@
   
   <script type="text/x-red" data-help-name="smart-valve-settings">
     <h3>Settings</h3>
+    <p>MQTT connection shared by all smart-valve nodes.</p>
     <dl class="message-properties">
+      <dt>Root path</dt><dd>Home Assistant discovery prefix, usually <code>homeassistant</code>.</dd>
+      <dt>HA discovery</dt><dd>When ticked, each valve publishes a Home Assistant device with Health, Problem, Requested setpoint and Room temperature entities.</dd>
+      <dt>State topic</dt><dd>Base topic for those states: <code>&lt;state topic&gt;/valve/&lt;valve name&gt;/state</code>.</dd>
     </dl>
   </script>
   

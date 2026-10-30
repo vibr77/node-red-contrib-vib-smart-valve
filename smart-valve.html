@@ -74,6 +74,17 @@
             
             debugInfo:{value:false},
             allowOverride:{value:false},
+            maxSp:{value:"24",validate:function(v){ return v==="" || v===undefined || (!isNaN(v) && Number(v)>=5 && Number(v)<=35); }},
+            heartbeat:{value:"10",validate:function(v){ return v==="" || v===undefined || (!isNaN(v) && Number(v)>=0 && Number(v)<=120); }},
+            sensorTimeout:{value:"120",validate:function(v){ return v==="" || v===undefined || (!isNaN(v) && Number(v)>=0 && Number(v)<=1440); }},
+            trvTimeout:{value:"90",validate:function(v){ return v==="" || v===undefined || (!isNaN(v) && Number(v)>=0 && Number(v)<=1440); }},
+            alarmDuration:{value:"60",validate:function(v){ return v==="" || v===undefined || (!isNaN(v) && Number(v)>=0 && Number(v)<=1440); }},
+            frozenDelta:{value:"3",validate:function(v){ return v==="" || v===undefined || (!isNaN(v) && Number(v)>=0 && Number(v)<=20); }},
+            frozenDuration:{value:"60",validate:function(v){ return v==="" || v===undefined || (!isNaN(v) && Number(v)>=0 && Number(v)<=1440); }},
+            ackTimeout:{value:"5",validate:function(v){ return v==="" || v===undefined || (!isNaN(v) && Number(v)>=0 && Number(v)<=120); }},
+            failedAction:{value:"failedAction.release"},
+            trvLocalTempKey:{value:"local_temperature"},
+            trvAlarmKey:{value:"valve_alarm"},
            
         },
 
@@ -114,6 +125,12 @@
         },
         oneditprepare: function() {
             const node = this;
+            // 0.82: nodes created with an older version have no value for the new options. Show the
+            // default that the runtime applies instead of an empty field.
+            ['maxSp','heartbeat','sensorTimeout','trvTimeout','alarmDuration','frozenDelta','frozenDuration','ackTimeout','failedAction','trvLocalTempKey','trvAlarmKey'].join(',').split(',').forEach(function(k){
+                var d = node._def.defaults[k];
+                if (d && (node[k]===undefined || node[k]==="" || node[k]===null)) { $('#node-input-'+k).val(d.value); }
+            });
         },
         oneditsave: function() {
             const node = this;
@@ -255,6 +272,67 @@
         <label for="node-input-OverrideDuration"><i class="fa fa-chain-broken">&nbsp;</i>Manual </label>
         <input type="text" title="storm Message limit" style="width:60px !important; text-align: right;" id="node-input-OverrideDuration"></input>
         <span>min duration</span>
+    </div>
+
+    <div class="form-row">
+        <span><i class="fa fa-shield">&nbsp;</i><b>Safety</b> (0 disables a check)</span>
+    </div>
+    <div class="form-row">
+        <label for="node-input-maxSp"><i class="fa fa-shield">&nbsp;</i>Max setpoint</label>
+        <input type="text" id="node-input-maxSp" title="Highest setpoint applied to the TRV or sent to the boiler" style="width:60px !important; text-align: right;"></input>
+        <span>°C</span>
+    </div>
+    <div class="form-row">
+        <label for="node-input-heartbeat"><i class="fa fa-shield">&nbsp;</i>Heartbeat</label>
+        <input type="text" id="node-input-heartbeat" title="Re-send the demand to the boiler at least this often" style="width:60px !important; text-align: right;"></input>
+        <span>min</span>
+    </div>
+    <div class="form-row">
+        <label for="node-input-sensorTimeout"><i class="fa fa-shield">&nbsp;</i>Sensor timeout</label>
+        <input type="text" id="node-input-sensorTimeout" title="Room sensor silent this long: room FAILED" style="width:60px !important; text-align: right;"></input>
+        <span>min</span>
+    </div>
+    <div class="form-row">
+        <label for="node-input-trvTimeout"><i class="fa fa-shield">&nbsp;</i>TRV timeout</label>
+        <input type="text" id="node-input-trvTimeout" title="TRV silent this long: room FAILED" style="width:60px !important; text-align: right;"></input>
+        <span>min</span>
+    </div>
+    <div class="form-row">
+        <label for="node-input-alarmDuration"><i class="fa fa-shield">&nbsp;</i>Valve alarm</label>
+        <input type="text" id="node-input-alarmDuration" title="Valve alarm reported this long: room FAILED" style="width:60px !important; text-align: right;"></input>
+        <span>min</span>
+    </div>
+    <div class="form-row">
+        <label for="node-input-frozenDelta"><i class="fa fa-shield">&nbsp;</i>Frozen gap</label>
+        <input type="text" id="node-input-frozenDelta" title="TRV temperature this far from the room sensor (external sensor mode)" style="width:60px !important; text-align: right;"></input>
+        <span>°C</span>
+    </div>
+    <div class="form-row">
+        <label for="node-input-frozenDuration"><i class="fa fa-shield">&nbsp;</i>Frozen for</label>
+        <input type="text" id="node-input-frozenDuration" title="Gap held this long: room FAILED" style="width:60px !important; text-align: right;"></input>
+        <span>min</span>
+    </div>
+    <div class="form-row">
+        <label for="node-input-ackTimeout"><i class="fa fa-shield">&nbsp;</i>Ack timeout</label>
+        <input type="text" id="node-input-ackTimeout" title="Setpoint sent to the TRV but not confirmed within: room FAILED" style="width:60px !important; text-align: right;"></input>
+        <span>min</span>
+    </div>
+    <div class="form-row">
+        <label for="node-input-failedAction"><i class="fa fa-shield">&nbsp;</i>When FAILED</label>
+        <select id="node-input-failedAction" style="width:330px;">
+            <option value="failedAction.release">stop asking for heat (send off setpoint)</option>
+            <option value="failedAction.keep">keep the scheduled demand</option>
+        </select>
+    </div>
+    <div class="form-row">
+        <label for="node-input-trvLocalTempKey"><i class="fa fa-key">&nbsp;</i>TRV temp key</label>
+        <input type="text" id="node-input-trvLocalTempKey" title="Key of the TRV own temperature in its state payload" style="width:150px !important; "></input>
+        <span></span>
+    </div>
+    <div class="form-row">
+        <label for="node-input-trvAlarmKey"><i class="fa fa-key">&nbsp;</i>TRV alarm key</label>
+        <input type="text" id="node-input-trvAlarmKey" title="Key of the valve alarm in its state payload" style="width:150px !important; "></input>
+        <span></span>
     </div>
 
     <div class="form-row">      
@@ -529,5 +607,23 @@
         <li>Manual override allows integration with physical valve controls</li>
         <li><strong>State Persistence:</strong> The node automatically saves setpoint and temperature values to <code>~/.node-red/.node-red-state/valve-{node-id}.json</code>. This state is restored on Node-RED restarts and flow redeployments, ensuring valve settings persist across all system changes.</li>
     </ul>
+    <h3>Safety (0.82)</h3>
+    <p>The scheduler is the only source of the setpoint. The setpoint reported by the TRV is used as feedback:
+       with <b>Manual valve</b> off it is never forwarded to the boiler and the scheduled setpoint is pushed back to the TRV.
+       With Manual valve on, a change on the TRV becomes an override for the configured duration, capped at <b>Max setpoint</b>,
+       and the schedule is restored when it ends.</p>
+    <p>Each room has a health state, shown in the node status, sent to the boiler (<code>payload.health</code>,
+       <code>payload.reasons</code>) and optionally to Home Assistant:</p>
+    <ul>
+      <li><b>OK</b>: all checks pass.</li>
+      <li><b>DEGRADED</b>: a problem has started but not lasted long enough (valve alarm, frozen TRV) or no room temperature yet.</li>
+      <li><b>FAILED</b>: <code>sensor_silent</code> (room sensor quiet longer than Sensor timeout), <code>trv_silent</code>
+          (no TRV message for TRV timeout), <code>valve_alarm</code> (alarm held for Valve alarm minutes),
+          <code>trv_frozen</code> (TRV temperature more than Frozen gap from the room sensor for Frozen for minutes,
+          external sensor mode only), <code>no_ack</code> (setpoint sent and not confirmed within Ack timeout).</li>
+    </ul>
+    <p>With <b>When FAILED</b> = stop asking for heat, a FAILED room sends the off setpoint to the boiler, so a broken TRV or sensor
+       cannot keep the boiler running. The valve keeps re-sending its setpoint so it recovers by itself when the device comes back.</p>
+    <p><b>Heartbeat</b>: the demand is re-sent to the boiler at least this often, which lets smart-boiler drop valves that went silent.</p>
 </script>
 
