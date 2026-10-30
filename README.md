@@ -109,7 +109,7 @@ TRV, all reading the same room sensor and sharing the same **Group id**.
 | **Off setpoint** | Setpoint sent to the boiler when the room is off or FAILED. Choose a value below any room temperature you will see, so it never creates demand. It only removes the room's demand from the boiler: the TRV keeps its last setpoint (to close a radiator, send it a low setpoint from the scheduler instead). | `5` °C |
 | **Mode** | When the setpoint is pushed to the TRV: *when state changes* (default, only when the schedule changes), *when state changes + startup*, or *every cycle* (re-sent at each cycle, more radio traffic). Since 0.82 the setpoint is also re-applied whenever the TRV reports something else and at start-up if the TRV disagrees. | when state changes |
 | **Cycle** | How often the node re-evaluates on its own (health checks, heartbeat, override expiry). | `1` min (minimum 1) |
-| **Manual valve** | Off: the TRV knob is ignored; any change on the TRV is pushed back to the scheduled value. On: a change on the TRV becomes a temporary override (capped at *Max setpoint*) and an `override` message is sent on the output for the other valves of the group. | off (recommended) |
+| **Manual valve** | Off: the TRV knob is ignored; any change on the TRV is pushed back to the scheduled value. On: a change on the TRV becomes a temporary override (capped at *Max setpoint*) and an `override` message is sent on the output for the other valves of the group. A knob turn while a scheduled setpoint is still being applied is also taken as an override; the value of an override that just expired coming back within 30 min is not (a TRV repeating a stale value). | off (recommended) |
 | **Manual … min duration** | How long an override lasts. When it ends, the scheduled setpoint is restored and pushed to the TRV (0.81 never restored it, and ignored this field). | `60` min |
 
 ### Safety (new in 0.82)
@@ -121,13 +121,18 @@ Each check can be disabled by setting it to `0`.
 | **Max setpoint** | Ceiling for any setpoint applied to the TRV or sent to the boiler, whatever its origin (schedule, knob, override). | `24` °C | Nothing in a house needs more. |
 | **Heartbeat** | The demand is re-sent to the boiler at least this often, even if nothing changed. This lets the boiler tell a quiet room from a dead one. | `10` min | Must stay well below the boiler's *Valve timeout* (30 min). |
 | **Sensor timeout** | If the room sensor sends nothing for this long, the room is FAILED (`sensor_silent`). | `120` min | Aqara sensors report at least about every 50 min. |
-| **TRV timeout** | If the TRV sends nothing for this long, the room is FAILED (`trv_silent`). | `90` min | Aqara TRVs check in about every 50 min even when idle. |
-| **Valve alarm** | The TRV reports a valve alarm (stuck pin, motor fault): DEGRADED at once, FAILED (`valve_alarm`) if it lasts this long. | `60` min | Lets a short calibration alarm clear by itself. |
+| **TRV timeout** | If the TRV sends nothing for more than half this time, the room is DEGRADED (warning, heating continues); after the full time it is FAILED (`trv_silent`). | `150` min | Aqara TRVs check in about every 50 min even when idle: one missed check-in is only a warning. |
+| **Valve alarm** | The TRV reports a valve alarm (stuck pin, motor fault): always DEGRADED (warning, heating continues). Above 0, the room becomes FAILED (`valve_alarm`) when the alarm lasts this long. | `0` (warning only) | Aqara TRVs can keep a stale alarm while working normally; a TRV that really stopped is caught by *Frozen* and *Ack timeout*. |
 | **Frozen gap** / **Frozen for** | In external sensor mode the TRV's own temperature should follow the room temperature we send it. If it stays more than *gap* away for *for* minutes, the TRV is considered frozen (`trv_frozen`). This is what caught TRV_CHLOE (31.9 °C against 20.4 °C). | `3` °C / `60` min | Normal lag is a few tenths of a degree. |
-| **Ack timeout** | After a setpoint is sent, the TRV must report it within this time, otherwise the room is FAILED (`no_ack`). The setpoint is then retried every 3 × this time; the room recovers by itself as soon as the TRV confirms. Armed only once the TRV has reported a setpoint at least once, so a wrong key cannot fail a healthy room. | `5` min | Zigbee2MQTT confirms within seconds. |
+| **Ack timeout** | After a setpoint is sent, the TRV must report it within this time (within 0.5 °C, as TRVs round to their step). If not, the setpoint is sent once more (DEGRADED); still not confirmed after a second period, the room is FAILED (`no_ack`). The setpoint is then retried every 3 × this time; the room recovers by itself as soon as the TRV confirms. Armed only once the TRV has reported a setpoint at least once, so a wrong key cannot fail a healthy room. | `5` min | Zigbee2MQTT confirms within seconds. |
 | **When FAILED** | *stop asking for heat* (send the Off setpoint to the boiler) or *keep the scheduled demand* (only report the problem). | stop asking | A broken room cannot be heated anyway. |
 | **TRV temp key** | Field of the TRV's own temperature in its state message. | `local_temperature` | Zigbee2MQTT name. |
 | **TRV alarm key** | Field of the valve alarm in its state message. | `valve_alarm` | Zigbee2MQTT name for Aqara E1. |
+
+**Status detail**: every state comes with a plain-language explanation of what is happening and what to do,
+shown in Home Assistant (entity *Status detail*, attribute `status`), for example: *"Warning, heating continues
+normally. The TRV reports a valve alarm since 22:50, but it still follows the room temperature (20.2 °C) and its
+setpoint. Check that the valve pin moves freely, then recalibrate the TRV."*
 
 **Health states**: `OK`, `DEGRADED` (a problem started, still heating), `FAILED` (see above),
 `UNKNOWN` (just started). The reasons (`sensor_silent`, `trv_silent`, `valve_alarm`, `trv_frozen`,
@@ -175,8 +180,10 @@ device **SmartValve <name>** with:
 | Problem (binary sensor) | on when DEGRADED or FAILED — use it for alerts |
 | Requested setpoint | what the room asks the boiler for (the Off setpoint when FAILED) |
 | Room temperature | from the room sensor |
+| Status detail | plain-language explanation of the state and what to do (first 255 characters; full text in the `status` attribute) |
+| Room sensor check, TRV link check, Valve alarm check, TRV tracking check, Setpoint confirmation check | one line per check, e.g. *"OK: 19.0 °C, reported 4 min ago (limit 120 min)."*; attribute `level` = `ok` / `warning` / `waiting` / `failed` / `off` |
 
-All four share the state topic `smartheating/valve/<name>/state`, whose attributes include `reasons`,
+All these share the state topic `smartheating/valve/<name>/state`, whose attributes include `reasons`,
 `health_since`, `scheduled_setpoint`, `trv_setpoint`, `trv_temperature`, `trv_age_min`, `sensor_age_min`,
 `valve_alarm`, `override` and `mode`. The device becomes *unavailable* when Node-RED stops.
 

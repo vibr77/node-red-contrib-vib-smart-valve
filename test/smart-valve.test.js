@@ -26,7 +26,7 @@ function room(name, o = {}) {
     const v = RED.create('smart-valve', H.valveConfig('v_' + name, name, o.cfg || {}));
     clock.tick(10);                                     // MQTT connect + subscribe
     const th = new H.Sensor(`zigbee2mqtt/TH_${name}`, o.temp !== undefined ? o.temp : 19, o.sensorEvery || 20).start();
-    const trv = new H.Trv(`TRV_${name}`, { mode: o.mode, state: o.trvState, ignoreExternal: o.ignoreExternal }).start();
+    const trv = new H.Trv(`TRV_${name}`, { mode: o.mode, state: o.trvState, ignoreExternal: o.ignoreExternal, step: o.step, every: o.trvEvery }).start();
     sec(2);
     const r = { v, th, trv };
     rooms.push(r);
@@ -145,29 +145,43 @@ describe('smart-valve 0.82', function () {
             assert.strictEqual(lastBoiler(v).setpoint, '20.00');
         });
 
-        it('V-09 TRV silent -> FAILED trv_silent', function () {
+        it('V-09 TRV silent: DEGRADED after half the timeout (demand kept), FAILED after 150 min', function () {
             const { v, trv } = settledRoom('LOU');
             trv.mode = 'dead';
-            min(85);
+            min(70);
             assert.strictEqual(v.health.state, 'OK');
             min(10);
-            assert.ok(v.health.reasons.includes('trv_silent'));
+            assert.strictEqual(v.health.state, 'DEGRADED');
+            assert.deepStrictEqual(v.health.reasons, ['trv_silent']);
+            assert.strictEqual(lastBoiler(v).setpoint, '20.00');
+            min(75);
+            assert.strictEqual(v.health.state, 'FAILED');
             assert.strictEqual(lastBoiler(v).setpoint, '5.00');
         });
 
-        it('V-10 valve alarm -> DEGRADED at once, FAILED after the alarm duration, OK when cleared', function () {
+        it('V-10 valve alarm alone is a warning: DEGRADED, room keeps heating, OK when cleared', function () {
             const { v, trv } = settledRoom('LOU');
             trv.state.valve_alarm = true; trv.report();
             sec(2);
             assert.strictEqual(v.health.state, 'DEGRADED');
-            assert.strictEqual(lastBoiler(v).setpoint, '20.00', 'still heating while degraded');
-            min(61);
-            assert.strictEqual(v.health.state, 'FAILED');
-            assert.deepStrictEqual(v.health.reasons, ['valve_alarm']);
-            assert.strictEqual(lastBoiler(v).setpoint, '5.00');
+            min(180);
+            assert.strictEqual(v.health.state, 'DEGRADED', 'never escalates by default');
+            assert.strictEqual(lastBoiler(v).setpoint, '20.00', 'still heating');
             trv.state.valve_alarm = false; trv.report();
             sec(2);
             assert.strictEqual(v.health.state, 'OK');
+        });
+
+        it('V-10b "Valve alarm" above 0 escalates to FAILED after that many minutes', function () {
+            const { v, trv } = settledRoom('LOU', { cfg: { alarmDuration: '60' } });
+            trv.state.valve_alarm = true; trv.report();
+            sec(2);
+            min(59);
+            assert.strictEqual(v.health.state, 'DEGRADED');
+            min(2);
+            assert.strictEqual(v.health.state, 'FAILED');
+            assert.deepStrictEqual(v.health.reasons, ['valve_alarm']);
+            assert.strictEqual(lastBoiler(v).setpoint, '5.00');
         });
 
         it('V-11 frozen TRV (its temperature far from the room sensor) -> FAILED trv_frozen after 60 min', function () {
@@ -186,13 +200,16 @@ describe('smart-valve 0.82', function () {
             assert.strictEqual(v.health.state, 'OK');
         });
 
-        it('V-13 setpoint not acknowledged -> FAILED no_ack, retried, recovers when the TRV takes it', function () {
+        it('V-13 setpoint not acknowledged: sent again once (DEGRADED), then FAILED, retried, recovers', function () {
             const { v, trv } = settledRoom('LOU');
             trv.mode = 'stuck';
             schedule(v, 21);
             min(4);
             assert.strictEqual(v.health.state, 'OK');
             min(2);
+            assert.strictEqual(v.health.state, 'DEGRADED', 'first miss: sent again');
+            assert.strictEqual(lastBoiler(v).setpoint, '21.00');
+            min(6);
             assert.strictEqual(v.health.state, 'FAILED');
             assert.deepStrictEqual(v.health.reasons, ['no_ack']);
             assert.strictEqual(lastBoiler(v).setpoint, '5.00');
@@ -326,6 +343,170 @@ describe('smart-valve 0.82', function () {
             await RED.close(r.v);
             rooms = rooms.filter(x => x !== r); r.th.stop(); r.trv.stop();
             assert.strictEqual(H.broker.retained['smartheating/valve/lou/availability'], 'offline');
+        });
+    });
+
+    describe('Status detail (plain-language explanation)', function () {
+        const status = () => JSON.parse(H.broker.retained['smartheating/valve/lou/state']).status;
+
+        it('V-28 explains a healthy room, a valve alarm and a failure with times and actions', function () {
+            load({ haDiscovery: true });
+            const { th, trv } = settledRoom('LOU', { temp: 19 });
+            assert.match(status(), /^OK, following the schedule: 20\.0 °C, room 19\.0 °C, asking for heat\./);
+            trv.state.valve_alarm = true; trv.report();
+            sec(2);
+            assert.match(status(), /^Warning, heating continues normally\. The TRV reports a valve alarm since \d\d:\d\d, but it still follows the room temperature \(19\.0 °C\)/);
+            assert.match(status(), /recalibrate the TRV\.$/);
+            trv.state.valve_alarm = false; trv.report();
+            th.alive = false;
+            min(125);
+            assert.match(status(), /^FAILED: this room no longer asks the boiler for heat\. Room sensor silent for 12\d min \(limit 120 min\)/);
+        });
+
+        it('V-29 explains a frozen TRV and a setpoint not acknowledged', function () {
+            load({ haDiscovery: true });
+            const r = settledRoom('LOU', { temp: 19, ignoreExternal: true, trvState: { local_temperature: 31.9 } });
+            assert.match(status(), /The TRV reads 31\.9 °C while the room is 19\.0 °C since \d\d:\d\d: it no longer follows the room temperature.*becomes a failure at \d\d:\d\d/);
+            r.trv.mode = 'stuck';
+            schedule(r.v, 21);
+            min(6);
+            assert.match(status(), /Setpoint 21\.0 °C was not confirmed by the TRV within 5 min; sent again at \d\d:\d\d\./);
+            min(6);
+            assert.match(status(), /Setpoint 21\.0 °C sent at \d\d:\d\d was not confirmed by the TRV \(it reports 20\.0 °C\); retried every 15 min/);
+        });
+
+        const checks = () => JSON.parse(H.broker.retained['smartheating/valve/lou/state']).checks;
+
+        it('V-31 every check has its own line, also when everything is OK', function () {
+            load({ haDiscovery: true });
+            settledRoom('LOU', { temp: 19 });
+            const c = checks();
+            assert.deepStrictEqual(Object.keys(c).sort(), ['sensor', 'setpoint', 'tracking', 'trv_link', 'valve_alarm']);
+            Object.values(c).forEach(x => assert.strictEqual(x.level, 'ok', JSON.stringify(x)));
+            assert.match(c.sensor.text, /^OK: 19\.0 °C, reported \d+ min ago \(limit 120 min\)\.$/);
+            assert.match(c.trv_link.text, /^OK: last message \d+ min ago \(limit 150 min\)\.$/);
+            assert.strictEqual(c.valve_alarm.text, 'OK: no valve alarm reported.');
+            assert.strictEqual(c.tracking.text, 'OK: TRV reads 19.0 °C, room 19.0 °C (gap 0.0 °C, limit 3).');
+            assert.strictEqual(c.setpoint.text, 'OK: the TRV has 20.0 °C, as requested.');
+        });
+
+        it('V-32 each failing check explains itself; the others stay OK', function () {
+            load({ haDiscovery: true });
+            const r = settledRoom('LOU', { temp: 19 });
+            r.trv.state.valve_alarm = true; r.trv.report();
+            sec(2);
+            let c = checks();
+            assert.strictEqual(c.valve_alarm.level, 'warning');
+            assert.match(c.valve_alarm.text, /^Warning: alarm since \d\d:\d\d, the TRV still follows its setpoint and the room temperature\. Warning only \(Valve alarm = 0\)\./);
+            assert.strictEqual(c.sensor.level, 'ok');
+            r.trv.state.valve_alarm = false; r.trv.report();
+            r.th.alive = false;
+            min(125);
+            c = checks();
+            assert.strictEqual(c.sensor.level, 'failed');
+            assert.match(c.sensor.text, /^Failed: silent for 12\d min \(limit 120 min\)\. Check the sensor battery/);
+            assert.strictEqual(c.trv_link.level, 'ok');
+        });
+
+        it('V-33 tracking and setpoint checks: warning, waiting and failed', function () {
+            load({ haDiscovery: true });
+            const r = settledRoom('LOU', { temp: 19, ignoreExternal: true, trvState: { local_temperature: 31.9 } });
+            let c = checks();
+            assert.strictEqual(c.tracking.level, 'warning');
+            assert.match(c.tracking.text, /^Warning: TRV reads 31\.9 °C, room 19\.0 °C \(gap 12\.9 °C, limit 3\) since \d\d:\d\d\. Becomes a failure at \d\d:\d\d\./);
+            r.trv.mode = 'stuck';
+            schedule(r.v, 21);
+            sec(30);
+            c = checks();
+            assert.strictEqual(c.setpoint.level, 'waiting');
+            min(6);
+            c = checks();
+            assert.strictEqual(c.setpoint.level, 'warning');
+            assert.match(c.setpoint.text, /^Warning: 21\.0 °C not confirmed within 5 min, sent again at \d\d:\d\d\.$/);
+            min(6);
+            c = checks();
+            assert.strictEqual(c.setpoint.level, 'failed');
+            assert.match(c.setpoint.text, /^Failed: 21\.0 °C sent at \d\d:\d\d, the TRV still reports 20\.0 °C; retried every 15 min/);
+            min(60);
+            assert.strictEqual(checks().tracking.level, 'failed');
+        });
+
+        it('V-34 the five checks are published as Home Assistant entities', function () {
+            load({ haDiscovery: true });
+            settledRoom('LOU');
+            ['sensor', 'trv_link', 'valve_alarm', 'tracking', 'setpoint'].forEach(k => {
+                const cfg = JSON.parse(H.broker.retained['homeassistant/sensor/smartvalve_vLOU/check_' + k + '/config']);
+                assert.ok(cfg.name.endsWith('check'), cfg.name);
+                assert.strictEqual(cfg.value_template, `{{ value_json.checks.${k}.text[:255] }}`);
+            });
+        });
+
+        it('V-30 publishes the Status detail entity to Home Assistant', function () {
+            load({ haDiscovery: true });
+            settledRoom('LOU');
+            const cfg = JSON.parse(H.broker.retained['homeassistant/sensor/smartvalve_vLOU/status/config']);
+            assert.strictEqual(cfg.name, 'Status detail');
+            assert.strictEqual(cfg.state_topic, 'smartheating/valve/lou/state');
+        });
+    });
+
+    describe('Review fixes (0.82.1)', function () {
+        it('V-35 a TRV that rounds to 0.5 °C steps confirms 20.2 °C as 20 °C', function () {
+            const { v, trv } = settledRoom('LOU', { step: 0.5 });
+            schedule(v, 20.2);
+            min(20);
+            assert.strictEqual(trv.state.occupied_heating_setpoint, 20);
+            assert.strictEqual(v.health.state, 'OK');
+        });
+
+        it('V-36 manual valve on: a knob turn while a setpoint is being applied is taken as an override', function () {
+            const { v, trv } = settledRoom('LOU', { cfg: { allowOverride: true } });
+            trv.mode = 'stuck';
+            schedule(v, 21);
+            sec(5);
+            trv.mode = 'healthy';
+            trv.knob(22);
+            min(2);                                   // input just received: evaluation waits for the next cycle
+            assert.strictEqual(lastBoiler(v).setpoint, '22.00');
+            assert.strictEqual(v.overrideMode, true);
+            min(10);
+            assert.strictEqual(v.health.state, 'OK');
+        });
+
+        it('V-37 manual valve on: the expired override value coming back is not a new override', function () {
+            const { v, trv } = settledRoom('LOU', { cfg: { allowOverride: true, OverrideDuration: '30' } });
+            trv.knob(23);
+            sec(5);
+            assert.strictEqual(lastBoiler(v).setpoint, '23.00');
+            min(32);
+            assert.strictEqual(trv.state.occupied_heating_setpoint, 20, 'schedule restored');
+            trv.knob(23);                             // the TRV reverts to its stale value
+            min(2);
+            assert.strictEqual(lastBoiler(v).setpoint, '20.00');
+            assert.strictEqual(v.overrideMode, false);
+            assert.strictEqual(trv.state.occupied_heating_setpoint, 20, 'pushed back');
+        });
+
+        it('V-38 a setpoint restored at start-up is capped at max setpoint', function () {
+            const fs = require('fs'), path = require('path');
+            const dir = path.join(RED.settings.userDir, '.node-red-state');
+            fs.mkdirSync(dir, { recursive: true });
+            fs.writeFileSync(path.join(dir, 'valve-v_LOU.json'), JSON.stringify({ requestSp: 28, scheduledSp: 28, sp: 28, refTemp: 19 }));
+            const v = RED.create('smart-valve', H.valveConfig('v_LOU', 'LOU', { maxSp: '21' }));
+            rooms.push({ v, th: { stop() {} }, trv: { stop() {} } });
+            assert.strictEqual(v.requestSp, 21);
+            assert.strictEqual(v.scheduledSp, 21);
+        });
+
+        it('V-39 one missed TRV check-in (quiet TRV, ~52 min) warns but keeps heating', function () {
+            const { v, trv } = settledRoom('LOU', { trvEvery: 52 });
+            trv.mode = 'dead';
+            min(100);
+            assert.strictEqual(v.health.state, 'DEGRADED');
+            assert.strictEqual(lastBoiler(v).setpoint, '20.00');
+            trv.mode = 'healthy'; trv.report();
+            sec(2);
+            assert.strictEqual(v.health.state, 'OK');
         });
     });
 

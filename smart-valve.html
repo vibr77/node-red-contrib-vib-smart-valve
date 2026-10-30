@@ -77,8 +77,8 @@
             maxSp:{value:"24",validate:function(v){ return v==="" || v===undefined || (!isNaN(v) && Number(v)>=5 && Number(v)<=35); }},
             heartbeat:{value:"10",validate:function(v){ return v==="" || v===undefined || (!isNaN(v) && Number(v)>=0 && Number(v)<=120); }},
             sensorTimeout:{value:"120",validate:function(v){ return v==="" || v===undefined || (!isNaN(v) && Number(v)>=0 && Number(v)<=1440); }},
-            trvTimeout:{value:"90",validate:function(v){ return v==="" || v===undefined || (!isNaN(v) && Number(v)>=0 && Number(v)<=1440); }},
-            alarmDuration:{value:"60",validate:function(v){ return v==="" || v===undefined || (!isNaN(v) && Number(v)>=0 && Number(v)<=1440); }},
+            trvTimeout:{value:"150",validate:function(v){ return v==="" || v===undefined || (!isNaN(v) && Number(v)>=0 && Number(v)<=1440); }},
+            alarmDuration:{value:"0",validate:function(v){ return v==="" || v===undefined || (!isNaN(v) && Number(v)>=0 && Number(v)<=1440); }},
             frozenDelta:{value:"3",validate:function(v){ return v==="" || v===undefined || (!isNaN(v) && Number(v)>=0 && Number(v)<=20); }},
             frozenDuration:{value:"60",validate:function(v){ return v==="" || v===undefined || (!isNaN(v) && Number(v)>=0 && Number(v)<=1440); }},
             ackTimeout:{value:"5",validate:function(v){ return v==="" || v===undefined || (!isNaN(v) && Number(v)>=0 && Number(v)<=120); }},
@@ -294,13 +294,13 @@
     </div>
     <div class="form-row">
         <label for="node-input-trvTimeout"><i class="fa fa-shield">&nbsp;</i>TRV timeout</label>
-        <input type="text" id="node-input-trvTimeout" title="TRV silent this long: room FAILED" style="width:60px !important; text-align: right;"></input>
+        <input type="text" id="node-input-trvTimeout" title="TRV silent this long: room FAILED (DEGRADED after half)" style="width:60px !important; text-align: right;"></input>
         <span>min</span>
     </div>
     <div class="form-row">
         <label for="node-input-alarmDuration"><i class="fa fa-shield">&nbsp;</i>Valve alarm</label>
-        <input type="text" id="node-input-alarmDuration" title="Valve alarm reported this long: room FAILED" style="width:60px !important; text-align: right;"></input>
-        <span>min</span>
+        <input type="text" id="node-input-alarmDuration" title="0 = a valve alarm is only a warning (DEGRADED). Above 0: the room becomes FAILED when the alarm lasts this long." style="width:60px !important; text-align: right;"></input>
+        <span>min to FAILED (0 = warning only)</span>
     </div>
     <div class="form-row">
         <label for="node-input-frozenDelta"><i class="fa fa-shield">&nbsp;</i>Frozen gap</label>
@@ -616,11 +616,12 @@
        <code>payload.reasons</code>) and optionally to Home Assistant:</p>
     <ul>
       <li><b>OK</b>: all checks pass.</li>
-      <li><b>DEGRADED</b>: a problem has started but not lasted long enough (valve alarm, frozen TRV) or no room temperature yet.</li>
+      <li><b>DEGRADED</b>: a problem has started but not lasted long enough (valve alarm, frozen TRV, TRV quiet for more than half of TRV timeout, a setpoint not confirmed and sent a second time) or no room temperature yet.</li>
       <li><b>FAILED</b>: <code>sensor_silent</code> (room sensor quiet longer than Sensor timeout), <code>trv_silent</code>
-          (no TRV message for TRV timeout), <code>valve_alarm</code> (alarm held for Valve alarm minutes),
+          (no TRV message for TRV timeout), <code>valve_alarm</code> (only when Valve alarm is above 0 and the alarm lasts that long;
+          by default a valve alarm is a warning, since a TRV can keep a stale alarm while working normally),
           <code>trv_frozen</code> (TRV temperature more than Frozen gap from the room sensor for Frozen for minutes,
-          external sensor mode only), <code>no_ack</code> (setpoint sent and not confirmed within Ack timeout).</li>
+          external sensor mode only), <code>no_ack</code> (setpoint sent, sent again once, and still not confirmed after a second Ack timeout; a TRV that rounds to 0.5 °C steps counts as confirmed).</li>
     </ul>
     <p>With <b>When FAILED</b> = stop asking for heat, a FAILED room sends the off setpoint to the boiler, so a broken TRV or sensor
        cannot keep the boiler running. The valve keeps re-sending its setpoint so it recovers by itself when the device comes back.</p>

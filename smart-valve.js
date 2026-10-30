@@ -1,7 +1,7 @@
 
 /*
 __   _____ ___ ___        Author: Vincent BESSON
- \ \ / /_ _| _ ) _ \      Release: 0.82
+ \ \ / /_ _| _ ) _ \      Release: 0.82.1
   \ V / | || _ \   /      Date: 20261030
    \_/ |___|___/_|_\      Description: Nodered Heating Valve Management
                 2026      Licence: Creative Commons
@@ -119,8 +119,10 @@ module.exports = function(RED) {
         this.maxSp=opt(n.maxSp,24);                         // °C ceiling for any setpoint applied or forwarded
         this.heartbeat=opt(n.heartbeat,10,true);            // re-send to the boiler at least this often
         this.sensorTimeout=opt(n.sensorTimeout,120,true);   // reference sensor silent -> FAILED
-        this.trvTimeout=opt(n.trvTimeout,90,true);          // TRV silent -> FAILED (Aqara check-in ~ every 50 min)
-        this.alarmDuration=opt(n.alarmDuration,60,true);    // valve alarm on for this long -> FAILED
+        this.trvTimeout=opt(n.trvTimeout,150,true);         // TRV silent: DEGRADED after half, FAILED after this (Aqara check-in ~ every 50 min)
+        // Valve alarm: always shown as DEGRADED (a TRV can keep a stale alarm while working normally).
+        // alarmDuration > 0 escalates it to FAILED after that many minutes; 0 (default) = warning only.
+        this.alarmDuration=opt(n.alarmDuration,0,true);
         this.frozenDelta=opt(n.frozenDelta,3);              // °C gap TRV temperature vs room sensor
         this.frozenDuration=opt(n.frozenDuration,60,true);  // gap held this long -> FAILED
         this.ackTimeout=opt(n.ackTimeout,5,true);           // setpoint sent but not confirmed -> FAILED
@@ -186,6 +188,11 @@ module.exports = function(RED) {
             return f;
         }
 
+        // TRVs work in 0.5 °C steps: a reported setpoint within 0.5 °C of what we sent is a confirmation.
+        function sameAck(a,b){
+            return a!==undefined && b!==undefined && Math.abs(parseFloat(a)-parseFloat(b))<=0.5;
+        }
+
         function same(a,b){
             return a!==undefined && b!==undefined && Math.abs(parseFloat(a)-parseFloat(b))<0.05;
         }
@@ -229,9 +236,9 @@ module.exports = function(RED) {
             savedState = node.context().get("valveState");
         }
         if (savedState) {
-            node.requestSp = savedState.requestSp;
+            node.requestSp = savedState.requestSp!==undefined ? clampSp(savedState.requestSp) : undefined;
             node.sp = savedState.sp;
-            node.scheduledSp = savedState.scheduledSp;
+            node.scheduledSp = savedState.scheduledSp!==undefined ? clampSp(savedState.scheduledSp) : undefined;
             node.refTemp = savedState.refTemp;
             // A restored temperature counts as fresh from startup only: if the sensor stays silent
             // the room becomes FAILED after sensorTimeout instead of trusting it forever.
@@ -248,6 +255,98 @@ module.exports = function(RED) {
         // Health
         // ---------------------------------------------------------------------------------------
 
+        // Plain-language explanation of the current state, for people (node status, Home Assistant).
+        function hhmm(ts){ return ts ? moment(ts).format('HH:mm') : '?'; }
+        function explain(now){
+            const min=60000, parts=[];
+            const t=v=>v===undefined||v===null?'?':parseFloat(v).toFixed(1)+' °C';
+            node.health.reasons.forEach(function(r){
+                if (r==='no_sensor_data') parts.push('No room temperature received yet from the room sensor.');
+                else if (r==='sensor_silent') parts.push(`Room sensor silent for ${Math.round((now-node.refTempTs)/min)} min (limit ${node.sensorTimeout} min): the room temperature can no longer be trusted. Check the sensor battery and its Zigbee link.`);
+                else if (r==='trv_silent' && node.health.state!=='FAILED') parts.push(`TRV silent for ${Math.round((now-node.trv.lastMsgTs)/min)} min, a check-in was probably missed; it becomes a failure after ${node.trvTimeout} min.`);
+                else if (r==='trv_silent') parts.push(`TRV silent for ${node.trv.lastMsgTs?Math.round((now-node.trv.lastMsgTs)/min):'more than '+node.trvTimeout} min (limit ${node.trvTimeout} min). Check the TRV battery and its Zigbee link.`);
+                else if (r==='valve_alarm'){
+                    let ok = node.trv.localTemp!==undefined && node.refTemp!==undefined && Math.abs(node.trv.localTemp-node.refTemp)<=node.frozenDelta && !node.trv.noAck;
+                    let esc = (node.alarmDuration>0 && now<node.trv.alarmSince+node.alarmDuration*min) ? ` It becomes a failure at ${hhmm(node.trv.alarmSince+node.alarmDuration*min)} if it persists.` : '';
+                    parts.push(`The TRV reports a valve alarm since ${hhmm(node.trv.alarmSince)}`+(ok?`, but it still follows the room temperature (${t(node.refTemp)}) and its setpoint.`:'.')+esc+' Check that the valve pin moves freely, then recalibrate the TRV.');
+                }
+                else if (r==='trv_frozen'){
+                    let esc = (now-node.trv.frozenSince<node.frozenDuration*min) ? ` It becomes a failure at ${hhmm(node.trv.frozenSince+node.frozenDuration*min)} if it persists.` : '';
+                    parts.push(`The TRV reads ${t(node.trv.localTemp)} while the room is ${t(node.refTemp)} since ${hhmm(node.trv.frozenSince)}: it no longer follows the room temperature (frozen or lost its external sensor).${esc} Power-cycle the TRV.`);
+                }
+                else if (r==='no_ack' && !node.trv.noAck) parts.push(`Setpoint ${t(node.trv.pendingAck?node.trv.pendingAck.sp:node.requestSp)} was not confirmed by the TRV within ${node.ackTimeout} min; sent again at ${hhmm(node.trv.lastPushTs)}.`);
+                else if (r==='no_ack') parts.push(`Setpoint ${t(node.trv.pendingAck?node.trv.pendingAck.sp:node.requestSp)} sent at ${hhmm(node.trv.lastPushTs)} was not confirmed by the TRV (it reports ${t(node.trv.lastSp)}); retried every ${3*node.ackTimeout} min. Power-cycle or re-pair the TRV.`);
+            });
+            let head;
+            if (node.health.state==='FAILED') head = node.failedAction==='failedAction.keep' ? 'FAILED, demand kept (When FAILED = keep).' : 'FAILED: this room no longer asks the boiler for heat.';
+            else if (node.health.state==='DEGRADED') head = 'Warning, heating continues normally.';
+            else if (node.executionMode==false) head = 'Off: this room does not ask for heat.';
+            else if (node.health.state==='UNKNOWN') head = 'Starting.';
+            else {
+                let sp=node.requestSp, rt=node.refTemp;
+                head = node.overrideMode ? `OK, manual setpoint ${t(sp)} until ${hhmm(node.overrideStartTs+node.overrideDuration*min)}, room ${t(rt)}.`
+                     : `OK, following the schedule: ${t(sp)}, room ${t(rt)}${(sp!==undefined&&rt!==undefined&&parseFloat(sp)>parseFloat(rt))?', asking for heat.':', warm enough.'}`;
+            }
+            return [head].concat(parts).join(' ');
+        }
+
+        // One line per check, always present (also when OK), for a per-check view in Home Assistant.
+        // level: ok | warning | failed | waiting | off
+        function checkDetails(now){
+            const min=60000, R=node.health.reasons, F=node.health.state==='FAILED';
+            const t=v=>v===undefined||v===null?'?':parseFloat(v).toFixed(1)+' °C';
+            const lvl=(code, failedNow)=>R.includes(code) ? (failedNow ? 'failed' : 'warning') : 'ok';
+            const line=(level,text)=>({level:level, text:text});
+            const out={};
+
+            // Room sensor
+            if (node.refTemp===undefined) out.sensor=line('waiting','Waiting: no room temperature received yet.');
+            else {
+                let age=node.refTempTs?Math.round((now-node.refTempTs)/min):null;
+                let lim=node.sensorTimeout>0?` (limit ${node.sensorTimeout} min)`:' (not checked: timeout 0)';
+                out.sensor = R.includes('sensor_silent')
+                    ? line('failed',`Failed: silent for ${age} min${lim}. Check the sensor battery and its Zigbee link.`)
+                    : line(node.sensorTimeout>0?'ok':'off',`OK: ${t(node.refTemp)}, reported ${age} min ago${lim}.`);
+            }
+
+            // TRV link
+            if (!node.valveSetpointStateTopic) out.trv_link=line('off','Not checked: no TRV state topic configured.');
+            else if (R.includes('trv_silent') && now-node.trv.lastMsgTs<=node.trvTimeout*min) out.trv_link=line('warning',`Warning: last message ${Math.round((now-node.trv.lastMsgTs)/min)} min ago, a check-in was probably missed (failure after ${node.trvTimeout} min).`);
+            else if (R.includes('trv_silent')) out.trv_link=line('failed',`Failed: no message for ${node.trv.lastMsgTs?Math.round((now-node.trv.lastMsgTs)/min):'more than '+node.trvTimeout} min (limit ${node.trvTimeout} min). Check the TRV battery and its Zigbee link.`);
+            else if (!node.trv.lastMsgTs) out.trv_link=line('waiting','Waiting: no message from the TRV yet.');
+            else out.trv_link=line(node.trvTimeout>0?'ok':'off',`OK: last message ${Math.round((now-node.trv.lastMsgTs)/min)} min ago`+(node.trvTimeout>0?` (limit ${node.trvTimeout} min).`:' (not checked: timeout 0).'));
+
+            // Valve alarm
+            if (!node.trv.alarm) out.valve_alarm=line('ok','OK: no valve alarm reported.');
+            else {
+                let failedNow = F && node.alarmDuration>0 && now-node.trv.alarmSince>=node.alarmDuration*min;
+                let follows = node.trv.localTemp!==undefined && node.refTemp!==undefined && Math.abs(node.trv.localTemp-node.refTemp)<=node.frozenDelta && !node.trv.noAck;
+                let esc = node.alarmDuration>0 ? (failedNow?'':` Becomes a failure at ${hhmm(node.trv.alarmSince+node.alarmDuration*min)}.`) : ' Warning only (Valve alarm = 0).';
+                out.valve_alarm=line(failedNow?'failed':'warning',`${failedNow?'Failed':'Warning'}: alarm since ${hhmm(node.trv.alarmSince)}`+(follows?', the TRV still follows its setpoint and the room temperature.':'.')+esc+' Check the valve pin moves freely, then recalibrate the TRV.');
+            }
+
+            // TRV tracking (frozen)
+            if (!(node.frozenDelta>0)) out.tracking=line('off','Not checked: Frozen gap = 0.');
+            else if (!node.valveTemperatureSetTopic) out.tracking=line('off','Not checked: internal sensor mode (no room temperature sent to the TRV).');
+            else if (node.trv.localTemp===undefined || node.refTemp===undefined) out.tracking=line('waiting','Waiting: TRV or room temperature not received yet.');
+            else {
+                let gap=Math.abs(node.trv.localTemp-node.refTemp).toFixed(1);
+                if (R.includes('trv_frozen')){
+                    let failedNow = now-node.trv.frozenSince>=node.frozenDuration*min;
+                    out.tracking=line(failedNow?'failed':'warning',`${failedNow?'Failed':'Warning'}: TRV reads ${t(node.trv.localTemp)}, room ${t(node.refTemp)} (gap ${gap} °C, limit ${node.frozenDelta}) since ${hhmm(node.trv.frozenSince)}.`+(failedNow?'':` Becomes a failure at ${hhmm(node.trv.frozenSince+node.frozenDuration*min)}.`)+' Power-cycle the TRV.');
+                } else out.tracking=line('ok',`OK: TRV reads ${t(node.trv.localTemp)}, room ${t(node.refTemp)} (gap ${gap} °C, limit ${node.frozenDelta}).`);
+            }
+
+            // Setpoint confirmation
+            if (!(node.ackTimeout>0)) out.setpoint=line('off','Not checked: Ack timeout = 0.');
+            else if (node.trv.noAck) out.setpoint=line('failed',`Failed: ${t(node.trv.pendingAck?node.trv.pendingAck.sp:node.requestSp)} sent at ${hhmm(node.trv.lastPushTs)}, the TRV still reports ${t(node.trv.lastSp)}; retried every ${3*node.ackTimeout} min. Power-cycle or re-pair the TRV.`);
+            else if (node.trv.pendingAck && node.trv.pendingAck.retried) out.setpoint=line('warning',`Warning: ${t(node.trv.pendingAck.sp)} not confirmed within ${node.ackTimeout} min, sent again at ${hhmm(node.trv.pendingAck.ts)}.`);
+            else if (node.trv.pendingAck) out.setpoint=line('waiting',`Waiting: ${t(node.trv.pendingAck.sp)} sent at ${hhmm(node.trv.pendingAck.ts)}, confirmation expected within ${node.ackTimeout} min.`);
+            else if (node.trv.lastSp===undefined) out.setpoint=line('waiting','Waiting: the TRV has not reported its setpoint yet.');
+            else out.setpoint=line('ok',`OK: the TRV has ${t(node.trv.lastSp)}`+(node.sp!==undefined && !same(node.sp,node.trv.lastSp)?`, ${t(node.sp)} expected.`:', as requested.'));
+            return out;
+        }
+
         function computeHealth(now){
             let failed=[], degraded=[];
             const min=60000;
@@ -262,12 +361,14 @@ module.exports = function(RED) {
                 let lastTrv = node.trv.lastMsgTs>0 ? node.trv.lastMsgTs : node.startTs;
                 if (node.trvTimeout>0 && now-lastTrv>node.trvTimeout*min){
                     failed.push('trv_silent');
+                } else if (node.trvTimeout>0 && node.trv.lastMsgTs>0 && now-lastTrv>node.trvTimeout*min/2){
+                    degraded.push('trv_silent');        // one check-in missed: warn before failing
                 }
             }
 
             if (node.trv.alarm){
                 if (node.alarmDuration>0 && now-node.trv.alarmSince>=node.alarmDuration*min) failed.push('valve_alarm');
-                else degraded.push('valve_alarm');
+                else degraded.push('valve_alarm');      // default: warning only
             }
 
             // Only meaningful in external sensor mode, where the TRV's own reading mirrors the room
@@ -282,10 +383,13 @@ module.exports = function(RED) {
             }
 
             if (node.trv.pendingAck && node.ackTimeout>0 && now-node.trv.pendingAck.ts>node.ackTimeout*min){
-                node.trv.noAck=true;
+                if (!node.trv.pendingAck.retried) node.trv.retryNow=true;     // a lost Zigbee write: send it once more
+                else node.trv.noAck=true;
             }
             if (node.trv.noAck){
                 failed.push('no_ack');
+            } else if (node.trv.retryNow || (node.trv.pendingAck && node.trv.pendingAck.retried)){
+                degraded.push('no_ack');
             }
 
             let state = failed.length>0 ? 'FAILED' : (degraded.length>0 ? 'DEGRADED' : 'OK');
@@ -335,7 +439,7 @@ module.exports = function(RED) {
                 // so a wrong key or topic can never fail a healthy room.
                 if (node.valveSetpointStateTopic && node.valveSetpointKey && node.trv.lastSp!==undefined){
                     if (!node.trv.pendingAck || !same(node.trv.pendingAck.sp,sp)){
-                        node.trv.pendingAck={sp:parseFloat(sp),ts:now};
+                        node.trv.pendingAck={sp:parseFloat(sp),ts:now,prev:node.trv.lastSp,retried:false};
                     }
                 }
                 nlog(`Setpoint ${sp}°C sent to the TRV (${why})`,"debug");
@@ -385,7 +489,8 @@ module.exports = function(RED) {
                     node.trv.lastSp=valveSp;
                     nlog(`[MQTT] receive valve setpoint:${valveSp}`,"debug");
 
-                    if (node.trv.pendingAck && same(valveSp,node.trv.pendingAck.sp)){
+                    let guard = node.expiredOverride && sameAck(valveSp,node.expiredOverride.sp) && now-node.expiredOverride.ts<30*60000;
+                    if (node.trv.pendingAck && sameAck(valveSp,node.trv.pendingAck.sp)){
                         // The TRV confirmed what we sent.
                         node.trv.pendingAck=null;
                         if (node.trv.noAck){
@@ -398,11 +503,28 @@ module.exports = function(RED) {
                         node.requestSp=clampSp(valveSp);
                         flgProcess=true;
                     }
+                    else if ((node.trv.pendingAck || node.trv.noAck) && node.allowOverride==true && node.executionMode==true && !guard &&
+                             node.trv.pendingAck && node.trv.pendingAck.prev!==undefined && !sameAck(valveSp,node.trv.pendingAck.prev)){
+                        // A value that is neither what we sent nor what the TRV had before: someone turned the knob
+                        // while we were waiting. Accept it as a manual change (Manual valve on).
+                        nlog(`TRV changed by hand to ${valveSp}°C while ${node.trv.pendingAck.sp}°C was being applied`,"info");
+                        node.trv.pendingAck=null; node.trv.noAck=false; node.trv.retryNow=false;
+                        node.requestSp=clampSp(valveSp);
+                        node.sp=undefined;                    // evaluate() treats the difference as an override
+                        flgProcess=true;
+                    }
                     else if (node.trv.pendingAck || node.trv.noAck){
                         // Waiting for (or never got) the TRV to confirm our setpoint: whatever else it
                         // reports is not a manual change, it is a TRV that has not taken the command.
                     }
-                    else if (node.sp!==undefined && !same(valveSp,node.sp)){
+                    else if (guard && node.sp!==undefined && !sameAck(valveSp,node.sp)){
+                        // The value of the override that just expired comes back: a TRV repeating a stale value
+                        // (stuck, or its own schedule), not a person. Put the schedule back, do not re-override.
+                        nlog(`TRV reports ${valveSp}°C again right after that override expired -> ignored, schedule re-applied`,"warn");
+                        node.driftPending=true; node.driftForce=true;
+                        flgProcess=true;
+                    }
+                    else if (node.sp!==undefined && !sameAck(valveSp,node.sp)){
                         if (node.allowOverride==true && node.executionMode==true){
                             // Manual change on the TRV, accepted as an override (capped). evaluate() handles it.
                             let v=clampSp(valveSp);
@@ -492,7 +614,15 @@ module.exports = function(RED) {
                 ['binary_sensor','problem',Object.assign({name:'Problem',unique_id:uid+'_problem',device_class:'problem',value_template:"{{ 'ON' if value_json.health in ['FAILED','DEGRADED'] else 'OFF' }}"},common)],
                 ['sensor','setpoint',Object.assign({name:'Requested setpoint',unique_id:uid+'_setpoint',device_class:'temperature',unit_of_measurement:'°C',value_template:'{{ value_json.boiler_setpoint }}'},common)],
                 ['sensor','temperature',Object.assign({name:'Room temperature',unique_id:uid+'_temperature',device_class:'temperature',unit_of_measurement:'°C',value_template:'{{ value_json.temperature }}'},common)],
+                ['sensor','status',Object.assign({name:'Status detail',unique_id:uid+'_status',icon:'mdi:information-outline',value_template:'{{ value_json.status[:255] }}'},common)],
             ];
+            [['sensor','Room sensor check','mdi:thermometer-check'],['trv_link','TRV link check','mdi:access-point-check'],
+             ['valve_alarm','Valve alarm check','mdi:valve'],['tracking','TRV tracking check','mdi:chart-line-variant'],
+             ['setpoint','Setpoint confirmation check','mdi:check-network-outline']].forEach(function(c){
+                entities.push(['sensor','check_'+c[0],Object.assign({},common,{name:c[1],unique_id:uid+'_check_'+c[0],icon:c[2],
+                    value_template:`{{ value_json.checks.${c[0]}.text[:255] }}`,
+                    json_attributes_template:`{{ {'level': value_json.checks.${c[0]}.level} | tojson }}`})]);
+            });
             entities.forEach(function(e){
                 node.mqttstack.push({topic:`${ha.prefix}/${e[0]}/${uid}/${e[1]}/config`,payload:e[2],qos:1,retain:true});
             });
@@ -504,6 +634,8 @@ module.exports = function(RED) {
             const now=moment().valueOf();
             const st={
                 health:node.health.state,
+                status:explain(now),
+                checks:checkDetails(now),
                 reasons:node.health.reasons,
                 health_since:new Date(node.health.since).toISOString(),
                 temperature:node.refTemp!==undefined?parseFloat(node.refTemp):null,
@@ -520,7 +652,8 @@ module.exports = function(RED) {
                 group:node.groupId
             };
             const s=JSON.stringify(st);
-            const cmp=JSON.stringify(Object.assign({},st,{sensor_age_min:0,trv_age_min:0}));
+            const cmp=JSON.stringify(Object.assign({},st,{sensor_age_min:0,trv_age_min:0,status:st.status.replace(/\d+ min/g,''),
+                checks:JSON.stringify(st.checks).replace(/\d+ min ago/g,'')}));
             if (force || cmp!==node.lastHaPayload || now-node.lastHaPublishTs>=5*60000){
                 node.mqttstack.push({topic:stateTopic,payload:s,qos:0,retain:true});
                 node.lastHaPayload=cmp;
@@ -536,6 +669,7 @@ module.exports = function(RED) {
             if (node.overrideMode==true && moment().valueOf()-node.overrideStartTs>(node.overrideDuration*60000)){
                 nlog("Override duration expired, back to the schedule","info");
                 node.overrideMode=false;
+                node.expiredOverride={sp:node.requestSp, ts:moment().valueOf()};
                 if (node.scheduledSp!==undefined){
                     node.requestSp=node.scheduledSp;
                     node.inputTrigger=true;          // forces the scheduled setpoint to be pushed to the TRV
@@ -717,10 +851,18 @@ module.exports = function(RED) {
                 }
 
                 if (node.driftPending==true){
-                    if (node.allowOverride!=true && node.sp!==undefined && now-node.trv.lastPushTs>=60000){
+                    if ((node.allowOverride!=true || node.driftForce) && node.sp!==undefined && now-node.trv.lastPushTs>=60000){
                         pushSetpointToTrv(node.sp,'TRV out of line');
                     }
-                    node.driftPending=false;
+                    node.driftPending=false; node.driftForce=false;
+                }
+
+                // First confirmation missed: send the same setpoint once more before calling it a failure.
+                if (node.trv.retryNow && node.trv.pendingAck){
+                    node.trv.retryNow=false;
+                    let pa=node.trv.pendingAck;
+                    pushSetpointToTrv(pa.sp,'not confirmed, sent again');
+                    node.trv.pendingAck=Object.assign(pa,{ts:now,retried:true});
                 }
 
                 // Never confirmed: retry every 3 x ackTimeout so a recovered TRV gets back in line.
