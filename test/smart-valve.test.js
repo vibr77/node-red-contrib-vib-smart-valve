@@ -84,7 +84,7 @@ describe('smart-valve 0.82', function () {
         it('V-03 manual valve on: a knob change becomes an override, capped at max setpoint', function () {
             const { v, trv } = settledRoom('LOU', { cfg: { allowOverride: true, maxSp: '22' } });
             trv.knob(25);
-            sec(5);
+            sec(35);                                 // knob settles (20 s)
             const ov = v.sent.map(s => s.msg.payload).filter(p => p && p.command === 'override');
             assert.strictEqual(ov.length, 1);
             assert.strictEqual(ov[0].setpoint, 22);
@@ -95,7 +95,7 @@ describe('smart-valve 0.82', function () {
         it('V-04 override expires after the configured duration and the schedule is restored', function () {
             const { v, trv } = settledRoom('LOU', { cfg: { allowOverride: true, OverrideDuration: '30' } });
             trv.knob(22);
-            sec(5);
+            sec(35);                                 // knob settles (20 s)
             assert.strictEqual(lastBoiler(v).setpoint, '22.00');
             min(28);
             assert.strictEqual(lastBoiler(v).setpoint, '22.00', 'still overridden at 28 min');
@@ -107,7 +107,7 @@ describe('smart-valve 0.82', function () {
         it('V-05 a schedule change during an override is kept and applied when it ends', function () {
             const { v, trv } = settledRoom('LOU', { cfg: { allowOverride: true, OverrideDuration: '30' } });
             trv.knob(22);
-            sec(5);
+            sec(35);                                 // knob settles (20 s)
             schedule(v, 18);
             sec(5);
             assert.strictEqual(lastBoiler(v).setpoint, '22.00', 'override still wins');
@@ -476,7 +476,7 @@ describe('smart-valve 0.82', function () {
         it('V-37 manual valve on: the expired override value coming back is not a new override', function () {
             const { v, trv } = settledRoom('LOU', { cfg: { allowOverride: true, OverrideDuration: '30' } });
             trv.knob(23);
-            sec(5);
+            sec(35);                                 // knob settles (20 s)
             assert.strictEqual(lastBoiler(v).setpoint, '23.00');
             min(32);
             assert.strictEqual(trv.state.occupied_heating_setpoint, 20, 'schedule restored');
@@ -526,6 +526,267 @@ describe('smart-valve 0.82', function () {
             assert.ok(after.every(m => m.sp === 5), 'stays released for the rest of the night');
             assert.ok(!msgs.some(m => m.sp === 23 && m.t - START > 5 * 60000), 'never asks the boiler for 23 °C');
             assert.strictEqual(r.v.health.state, 'FAILED');
+        });
+    });
+
+    describe('Away mode (0.83)', function () {
+        const away = (v, val) => RED.input(v, { payload: val === undefined ? { command: 'away' } : { command: 'away', value: val } });
+
+        it('V-40 away: frost setpoint on the TRV and to the boiler, schedule kept and applied when back home', function () {
+            const { v, trv } = settledRoom('LOU', { temp: 19 });
+            away(v);
+            sec(5);
+            assert.strictEqual(v.away, true);
+            assert.strictEqual(trv.state.occupied_heating_setpoint, 7);
+            const p = lastBoiler(v);
+            assert.strictEqual(p.setpoint, '7.00');
+            assert.strictEqual(p.away, true);
+            schedule(v, 21);                                   // the scheduler keeps running while away
+            sec(5);
+            assert.strictEqual(trv.state.occupied_heating_setpoint, 7, 'schedule not applied while away');
+            assert.strictEqual(lastBoiler(v).setpoint, '7.00');
+            RED.input(v, { payload: { command: 'home' } });
+            sec(5);
+            assert.strictEqual(v.away, false);
+            assert.strictEqual(trv.state.occupied_heating_setpoint, 21, 'latest schedule applied on return');
+            assert.strictEqual(lastBoiler(v).setpoint, '21.00');
+            assert.strictEqual(lastBoiler(v).away, false);
+        });
+
+        it('V-41 away setpoint is configurable and still asks for heat below it (frost protection)', function () {
+            const { v, th } = settledRoom('LOU', { temp: 19, cfg: { awaySp: '8' } });
+            away(v, 'on');
+            th.temp = 6; th.report(); sec(5);
+            const p = lastBoiler(v);
+            assert.strictEqual(p.setpoint, '8.00');
+            assert.strictEqual(p.temperature, '6.00');
+            assert.match(v._status.text, /Away t:6.00°C, sp:8.00°C/);
+            assert.strictEqual(v._status.fill, "blue");
+        });
+
+        it('V-42 a knob turn while away is put back, an override running is cancelled, group overrides ignored', function () {
+            const { v, trv } = settledRoom('LOU', { cfg: { allowOverride: true } });
+            trv.knob(23);
+            sec(35);                                 // knob settles (20 s)
+            assert.strictEqual(v.overrideMode, true);
+            away(v, true);
+            sec(5);
+            assert.strictEqual(v.overrideMode, false, 'override cancelled');
+            assert.strictEqual(trv.state.occupied_heating_setpoint, 7);
+            trv.knob(22);
+            min(2);
+            assert.strictEqual(trv.state.occupied_heating_setpoint, 7, 'knob turn put back');
+            assert.ok(!v.sent.some(s => s.msg.payload.command === 'override' && s.msg.payload.setpoint === 22), 'no override sent');
+            RED.input(v, { payload: { command: 'override', setpoint: 24, requestedBy: 'OTHER', groupId: '1' } });
+            sec(5);
+            assert.strictEqual(trv.state.occupied_heating_setpoint, 7);
+            assert.strictEqual(lastBoiler(v).setpoint, '7.00');
+            RED.input(v, { payload: { command: 'home' } });
+            sec(5);
+            assert.strictEqual(trv.state.occupied_heating_setpoint, 20, 'schedule, not the cancelled override');
+        });
+
+        it('V-43 away survives a Node-RED restart', async function () {
+            const r = settledRoom('LOU');
+            away(r.v);
+            sec(5);
+            r.th.stop();
+            await RED.close(r.v);
+            rooms = [];
+            const v = RED.create('smart-valve', H.valveConfig('v_LOU', 'LOU'));
+            const th = new H.Sensor('zigbee2mqtt/TH_LOU', 19, 20).start();
+            rooms.push({ v, th, trv: r.trv });
+            sec(5);
+            assert.strictEqual(v.away, true);
+            assert.strictEqual(r.trv.state.occupied_heating_setpoint, 7);
+            assert.strictEqual(lastBoiler(v).setpoint, '7.00');
+        });
+
+        it('V-44 invalid away values are rejected', function () {
+            const { v } = settledRoom('LOU');
+            assert.doesNotThrow(() => away(v, 'maybe'));
+            assert.strictEqual(v.away, false);
+        });
+
+        it('V-45 Home Assistant: Away switch discovered, set from Home Assistant, state and retained command in line', function () {
+            load({ haDiscovery: true });
+            const { v, trv } = settledRoom('LOU');
+            const uid = 'smartvalve_vLOU';
+            const cfg = JSON.parse(H.broker.retained['homeassistant/switch/' + uid + '/away/config']);
+            assert.strictEqual(cfg.command_topic, 'smartheating/valve/lou/away/set');
+            assert.strictEqual(cfg.state_topic, 'smartheating/valve/lou/state');
+            let st = JSON.parse(H.broker.retained['smartheating/valve/lou/state']);
+            assert.strictEqual(st.away, false);
+            H.broker.publish('smartheating/valve/lou/away/set', 'ON', { retain: true });
+            sec(5);
+            assert.strictEqual(v.away, true);
+            assert.strictEqual(trv.state.occupied_heating_setpoint, 7);
+            st = JSON.parse(H.broker.retained['smartheating/valve/lou/state']);
+            assert.strictEqual(st.away, true);
+            assert.strictEqual(st.away_setpoint, 7);
+            assert.match(st.status, /^Away: frost protection at 7\.0 °C/);
+            RED.input(v, { payload: { command: 'home' } });      // from a flow, not from Home Assistant
+            sec(5);
+            assert.strictEqual(H.broker.retained['smartheating/valve/lou/away/set'], 'OFF', 'retained command follows');
+            assert.strictEqual(JSON.parse(H.broker.retained['smartheating/valve/lou/state']).away, false);
+            assert.strictEqual(trv.state.occupied_heating_setpoint, 20);
+        });
+    });
+
+    describe('Manual change: rotary knob and room sync (0.84)', function () {
+        const ov = (v) => v.sent.map(x => x.msg.payload).filter(p => p && p.command === 'override');
+        const grp = (g) => H.broker.on(`smartheating/group/${g}/manual`);
+        const salon = (cfg = {}) => ['BIBLIO', 'ESCALIER', 'CANAPE'].map(n => settledRoom(n, { cfg: Object.assign({ allowOverride: true, groupId: '3' }, cfg) }));
+
+        it('V-50 a rotary knob (20.5, 21, 21.5, 22 in 6 s) gives one override at 22 once it stays still', function () {
+            const { v, trv } = settledRoom('LOU', { cfg: { allowOverride: true } });
+            const b0 = boilerMsgs(v).length;
+            [20.5, 21, 21.5, 22].forEach(sp => { trv.knob(sp); sec(2); });
+            sec(10);
+            assert.strictEqual(ov(v).length, 0, 'nothing while the knob moves');
+            assert.strictEqual(trv.state.occupied_heating_setpoint, 22, 'the knob is never fought');
+            assert.match(v._status.text, /Knob 22\.0°C settling/);
+            sec(10);                                    // last step at 6 s -> taken at 26 s
+            assert.strictEqual(ov(v).length, 1, 'taken 20 s after the last step');
+            assert.strictEqual(ov(v)[0].setpoint, 22);
+            assert.strictEqual(v.overrideMode, true);
+            const sps = boilerMsgs(v).slice(b0).map(m => m.msg.payload.setpoint);
+            assert.deepStrictEqual([...new Set(sps)], ['22.00'], 'boiler never sees the intermediate steps');
+        });
+
+        it('V-51 a single detent (0.5 °C) is a manual change', function () {
+            const { v } = settledRoom('LOU', { cfg: { allowOverride: true } });
+            v.sent.length = 0;
+            const trv = rooms[0].trv;
+            trv.knob(20.5);
+            sec(35);
+            assert.strictEqual(ov(v).length, 1);
+            assert.strictEqual(lastBoiler(v).setpoint, '20.50');
+        });
+
+        it('V-52 knob turned and back to the setpoint before it settles: nothing happens', function () {
+            const { v, trv } = settledRoom('LOU', { cfg: { allowOverride: true } });
+            trv.knob(21); sec(3); trv.knob(20.5); sec(3); trv.knob(20);
+            sec(40);
+            assert.strictEqual(ov(v).length, 0);
+            assert.strictEqual(v.overrideMode, false);
+            assert.strictEqual(v.manual, null);
+            assert.strictEqual(lastBoiler(v).setpoint, '20.00');
+        });
+
+        it('V-53 a knob that never settles (jittering TRV) is still taken and shared after 1 min', function () {
+            const { v, trv } = settledRoom('LOU', { cfg: { allowOverride: true } });
+            for (let i = 0; i < 3; i++) { trv.knob(i % 2 ? 21.5 : 21); sec(15); }   // steps at 0, 15, 30 s
+            trv.knob(21.5); sec(14);                                                 // step at 45 s, now 59 s
+            assert.strictEqual(ov(v).length, 0, 'still waiting at 59 s');
+            sec(1);
+            assert.strictEqual(ov(v).length, 1, 'taken at 60 s');
+            assert.strictEqual(v.overrideMode, true);
+        });
+
+        it('V-54 a knob turn in a 3-valve room is applied to the others with the same end time, once, without wiring', function () {
+            const [a, b, c] = salon();
+            const lou = settledRoom('LOU', { cfg: { allowOverride: true, groupId: '51' } });
+            a.trv.knob(21.5); sec(1); a.trv.knob(22);
+            sec(35);
+            assert.strictEqual(grp(3).length, 1, 'one group message');
+            [b, c].forEach(r => {
+                assert.strictEqual(r.trv.state.occupied_heating_setpoint, 22);
+                assert.strictEqual(r.v.overrideMode, true);
+                assert.strictEqual(r.v.overrideStartTs, a.v.overrideStartTs, 'same end time');
+                assert.strictEqual(ov(r.v).length, 0, 'receivers do not re-broadcast');
+                assert.strictEqual(lastBoiler(r.v).setpoint, '22.00');
+            });
+            assert.strictEqual(lou.trv.state.occupied_heating_setpoint, 20, 'other room untouched');
+            min(5);
+            assert.strictEqual(grp(3).length, 1, 'TRV echoes are not new manual changes');
+            min(56);
+            [a, b, c].forEach(r => {
+                assert.strictEqual(r.v.overrideMode, false);
+                assert.strictEqual(r.trv.state.occupied_heating_setpoint, 20, 'schedule back everywhere');
+            });
+        });
+
+        it('V-55 the same change received twice (MQTT and flow wiring) is applied once', function () {
+            const [a, b] = salon();
+            a.trv.knob(22);
+            sec(35);
+            const start = b.v.overrideStartTs, sets = b.trv.sets.length;
+            RED.input(b.v, { payload: ov(a.v)[0] });          // as if a's output were wired to b
+            sec(5);
+            assert.strictEqual(b.v.overrideStartTs, start);
+            assert.strictEqual(b.trv.sets.length, sets, 'no second push');
+        });
+
+        it('V-56 valves with Manual valve off, off or away ignore the room change', function () {
+            const a = settledRoom('BIBLIO', { cfg: { allowOverride: true, groupId: '3' } });
+            const b = settledRoom('ESCALIER', { cfg: { allowOverride: false, groupId: '3' } });
+            const c = settledRoom('CANAPE', { cfg: { allowOverride: true, groupId: '3' } });
+            RED.input(c.v, { payload: { command: 'away' } }); sec(5);
+            a.trv.knob(22);
+            sec(35);
+            assert.strictEqual(b.trv.state.occupied_heating_setpoint, 20);
+            assert.strictEqual(c.trv.state.occupied_heating_setpoint, 7);
+            assert.strictEqual(b.v.overrideMode, false);
+        });
+
+        it('V-57 a room override survives a restart and still ends on time', async function () {
+            const [a, b] = salon();
+            a.trv.knob(22);
+            sec(35);
+            min(10);
+            b.th.stop();
+            await RED.close(b.v);
+            rooms = rooms.filter(r => r !== b);
+            const v = RED.create('smart-valve', H.valveConfig('v_ESCALIER', 'ESCALIER', { allowOverride: true, groupId: '3' }));
+            const th = new H.Sensor('zigbee2mqtt/TH_ESCALIER', 19, 20).start();
+            rooms.push({ v, th, trv: b.trv });
+            sec(5);
+            assert.strictEqual(v.overrideMode, true);
+            assert.strictEqual(lastBoiler(v).setpoint, '22.00');
+            min(51);
+            assert.strictEqual(v.overrideMode, false);
+            assert.strictEqual(b.trv.state.occupied_heating_setpoint, 20);
+        });
+
+        it('V-58 the room change is capped at Max setpoint on every valve', function () {
+            const [a, b] = salon({ maxSp: '22' });
+            a.trv.knob(25);
+            sec(40);
+            assert.strictEqual(a.trv.state.occupied_heating_setpoint, 22);
+            assert.strictEqual(b.trv.state.occupied_heating_setpoint, 22);
+        });
+
+        it('V-59 a schedule change during the room override is applied to every valve when it ends', function () {
+            const rs = salon();
+            rs[0].trv.knob(22);
+            sec(35);
+            rs.forEach(r => schedule(r.v, 18));
+            sec(5);
+            rs.forEach(r => assert.strictEqual(r.trv.state.occupied_heating_setpoint, 22));
+            min(61);
+            rs.forEach(r => assert.strictEqual(r.trv.state.occupied_heating_setpoint, 18));
+        });
+
+        it('V-60 "Share with room" off: the change stays on its own valve', function () {
+            const [a, b] = salon({ groupSync: false });
+            a.trv.knob(22);
+            sec(35);
+            assert.strictEqual(grp(3).length, 0);
+            assert.strictEqual(a.v.overrideMode, true);
+            assert.strictEqual(b.trv.state.occupied_heating_setpoint, 20);
+        });
+
+        it('V-61 Home Assistant shows when the override ends and a knob settling', function () {
+            load({ haDiscovery: true });
+            const { trv } = settledRoom('LOU', { cfg: { allowOverride: true } });
+            trv.knob(22); sec(3);
+            let st = JSON.parse(H.broker.retained['smartheating/valve/lou/state']);
+            sec(35);
+            st = JSON.parse(H.broker.retained['smartheating/valve/lou/state']);
+            assert.strictEqual(st.override, true);
+            assert.ok(st.override_until && Date.parse(st.override_until) > Date.now() + 59 * 60000);
+            assert.strictEqual(st.knob_settling, null);
         });
     });
 });

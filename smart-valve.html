@@ -59,6 +59,7 @@
             }},
             
             cycleDuration: {value:"5"},
+            awaySp: {value:"7",validate:function(v){ return v==="" || v===undefined || (!isNaN(v) && Number(v)>=0 && Number(v)<=16); }},
             offSp: {value:"5",required:true,validate:function(v){
                 if (isNaN(v)){
                     return false;
@@ -74,6 +75,9 @@
             
             debugInfo:{value:false},
             allowOverride:{value:false},
+            manualMaxWait:{value:"60",validate:function(v){ return v==="" || v===undefined || (!isNaN(v) && Number(v)>=2 && Number(v)<=600); }},
+            manualSettle:{value:"20",validate:function(v){ return v==="" || v===undefined || (!isNaN(v) && Number(v)>=2 && Number(v)<=300); }},
+            groupSync:{value:true},
             maxSp:{value:"24",validate:function(v){ return v==="" || v===undefined || (!isNaN(v) && Number(v)>=5 && Number(v)<=35); }},
             heartbeat:{value:"10",validate:function(v){ return v==="" || v===undefined || (!isNaN(v) && Number(v)>=0 && Number(v)<=120); }},
             sensorTimeout:{value:"120",validate:function(v){ return v==="" || v===undefined || (!isNaN(v) && Number(v)>=0 && Number(v)<=1440); }},
@@ -127,7 +131,7 @@
             const node = this;
             // 0.82: nodes created with an older version have no value for the new options. Show the
             // default that the runtime applies instead of an empty field.
-            ['maxSp','heartbeat','sensorTimeout','trvTimeout','alarmDuration','frozenDelta','frozenDuration','ackTimeout','failedAction','trvLocalTempKey','trvAlarmKey'].join(',').split(',').forEach(function(k){
+            ['awaySp','manualSettle','manualMaxWait','maxSp','heartbeat','sensorTimeout','trvTimeout','alarmDuration','frozenDelta','frozenDuration','ackTimeout','failedAction','trvLocalTempKey','trvAlarmKey'].join(',').split(',').forEach(function(k){
                 var d = node._def.defaults[k];
                 if (d && (node[k]===undefined || node[k]==="" || node[k]===null)) { $('#node-input-'+k).val(d.value); }
             });
@@ -249,6 +253,12 @@
         <label for="node-input-offSp">°C</label>
     </div>
 
+    <div class="form-row">
+        <label for="node-input-awaySp"><i class="fa fa-suitcase">&nbsp;</i> Away setpoint</label>
+        <input type="text" id="node-input-awaySp" placeholder="7" title="Frost protection setpoint applied to the TRV and sent to the boiler while away" style="width:60px !important; text-align: right;"></input>
+        <label for="node-input-awaySp">°C</label>
+    </div>
+
      <div class="form-row">
         <span><i class="fa fa-tasks">&nbsp;</i>Update</span>
     </div>
@@ -272,6 +282,21 @@
         <label for="node-input-OverrideDuration"><i class="fa fa-chain-broken">&nbsp;</i>Manual </label>
         <input type="text" title="storm Message limit" style="width:60px !important; text-align: right;" id="node-input-OverrideDuration"></input>
         <span>min duration</span>
+    </div>
+    <div class="form-row">
+        <label for="node-input-manualSettle"><i class="fa fa-hourglass-half">&nbsp;</i>Knob settle</label>
+        <input type="text" id="node-input-manualSettle" title="A knob turn is taken once the knob stays still this long (a rotary knob reports every 0.5 °C step)" style="width:60px !important; text-align: right;"></input>
+        <span>s</span>
+    </div>
+    <div class="form-row">
+        <label for="node-input-manualMaxWait"><i class="fa fa-hourglass-end">&nbsp;</i>Knob max wait</label>
+        <input type="text" id="node-input-manualMaxWait" title="A knob that keeps moving is taken and shared with the room after this at most" style="width:60px !important; text-align: right;"></input>
+        <span>s</span>
+    </div>
+    <div class="form-row">
+        <label for="node-input-groupSync"><i class="fa fa-share-alt">&nbsp;</i>Share with room</label>
+        <input type="checkbox" id="node-input-groupSync" title="Apply a knob turn to every valve with the same Group id (Manual valve on), through MQTT, no wiring needed" style="width:auto;"></input>
+        <span>same Group id</span>
     </div>
 
     <div class="form-row">
@@ -465,7 +490,8 @@
 
     <h3>INPUT MESSAGE FORMAT:</h3>
     <pre><code></code>  msg.payload = {
-            command:        [number], [1|set|on|0|off|trigger|override]      // Input message command
+            command:        [number], [1|set|on|0|off|trigger|override|away|home]  // Input message command
+            value:          [boolean|"on"|"off"]                             // away only: true (default) = away, false = back home
             setpoint:       [number],                                        // Requested temperature set point
             temperature:    [number],                                        // Current valve temperature
             requestedBy:    [string],                                        // Command requester (in case of override valve name) 
@@ -561,6 +587,7 @@
             <tr><td>Valve mode</td><td>Current mode of the valve [heat|off], this is linked with home assistant climate current mode</td></tr>
             <tr><td>Valve Sensor Internal/External</td><td>Some valve manufacturer requires a specific MQTT message to use external sensor (such as aqara), this enable a MQTT topic with a specific payload</td></tr>
             <tr><td>Off setpoint</td><td>Temperature threshold (0-35°C) for "off" state</td></tr>
+            <tr><td>Away setpoint</td><td>Frost protection setpoint (0-16°C, default 7) applied to the TRV and sent to the boiler while away</td></tr>
             <tr><td>Update mode</td><td>Trigger condition for updates (state change, startup, cycle)</td></tr>
             <tr><td>Update cycle</td><td>Duration in minutes between cycles</td></tr>
             <tr><td>Manual update</td><td>Enable manual set point changes on valves</td></tr>
@@ -626,5 +653,24 @@
     <p>With <b>When FAILED</b> = stop asking for heat, a FAILED room sends the off setpoint to the boiler, so a broken TRV or sensor
        cannot keep the boiler running. The valve keeps re-sending its setpoint so it recovers by itself when the device comes back.</p>
     <p><b>Heartbeat</b>: the demand is re-sent to the boiler at least this often, which lets smart-boiler drop valves that went silent.</p>
+    <h3>Manual change and room sync (0.84)</h3>
+    <p>With <b>Manual valve</b> on, a knob turn on the TRV is taken once the knob has stayed still for <b>Knob settle</b> seconds
+       (default 20; a rotary knob reports every 0.5 °C step), and at most after <b>Knob max wait</b> (default 60 s) for a knob that keeps moving. While it settles
+       nothing is pushed back to the TRV and the boiler keeps the previous demand. The last value (capped at Max setpoint) becomes an
+       override for <b>Manual … min duration</b>.</p>
+    <p>With <b>Share with room</b> on, the change is published once on <code>smartheating/group/&lt;Group id&gt;/manual</code> and every
+       other valve with the same Group id (and Manual valve on, not off or away) applies the same setpoint with the same end time,
+       so the whole room returns to the schedule together. No flow wiring is needed; the <code>override</code> message is still sent
+       on the output for older flows, duplicates are ignored. An override survives a restart. Group id must then be unique per room.</p>
+    <h3>Away (0.83)</h3>
+    <p><code>{command:"away"}</code> (or <code>{command:"away", value:false}</code> / <code>{command:"home"}</code>), or the
+       <b>Away</b> switch in Home Assistant (topic <code>smartheating/valve/&lt;name&gt;/away/set</code>, payload <code>ON</code>/<code>OFF</code>).</p>
+    <ul>
+      <li>The TRV gets the <b>Away setpoint</b> (frost protection) and the boiler receives it with <code>away:true</code>:
+          the room only asks for heat if it falls below that temperature.</li>
+      <li>The schedule keeps being recorded and is applied again when back home; a running override is cancelled;
+          a knob turn on the TRV is put back; overrides from the group are ignored.</li>
+      <li>Saved across Node-RED restarts and deploys; health checks keep running.</li>
+    </ul>
 </script>
 

@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.84.0 — 2026-11-01
+
+- Rotary knob: a knob turn is taken once the knob stays still for **Knob settle** seconds (default 20), and at most
+  after **Knob max wait** (default 60 s); the steps in between are neither pushed back nor sent to the boiler, turning back cancels it.
+- Room sync (**Share with room**, default on): the manual change is published once on
+  `smartheating/group/<Group id>/manual` and applied by every other valve of the group (Manual valve on) with the same
+  end time, no flow wiring needed. The `override` output message carries `start`/`duration`; duplicates are ignored.
+- A single 0.5 °C detent is now detected (it was taken as TRV rounding).
+- An override in progress survives a restart and still ends on time (it used to stay until the next schedule change).
+- Home Assistant: `override_until`, `knob_settling`.
+
+## 0.83.0 — 2026-11-01
+
+- Away mode: `{command:"away"}` / `{command:"home"}` or the new **Away** switch in Home Assistant
+  (`smartheating/valve/<name>/away/set`, ON/OFF, retained). The TRV gets the new **Away setpoint** (frost protection,
+  default 7 °C), the boiler receives it with `away: true`, the schedule is recorded and applied again on return,
+  a running override is cancelled, knob turns are put back, group overrides ignored. Saved across restarts.
+- Home Assistant state: `away`, `away_setpoint`; status and Status detail show *Away*.
+- Fix: a TRV changed within one minute of a push (manual valve off) is now put back at the next cycle instead of
+  being left as is.
+
 ## 0.82.1 — 2026-10-30
 
 - A valve alarm alone no longer makes a room FAILED: it is a warning (DEGRADED) by default, because Aqara TRVs

@@ -106,10 +106,14 @@ TRV, all reading the same room sensor and sharing the same **Group id**.
 
 | Field | What it does | Default |
 |---|---|---|
+| **Away setpoint** | Frost protection setpoint while the room is *away* (see below): applied to the TRV and sent to the boiler, so the room asks for heat only if it falls below it. | `7` °C |
 | **Off setpoint** | Setpoint sent to the boiler when the room is off or FAILED. Choose a value below any room temperature you will see, so it never creates demand. It only removes the room's demand from the boiler: the TRV keeps its last setpoint (to close a radiator, send it a low setpoint from the scheduler instead). | `5` °C |
 | **Mode** | When the setpoint is pushed to the TRV: *when state changes* (default, only when the schedule changes), *when state changes + startup*, or *every cycle* (re-sent at each cycle, more radio traffic). Since 0.82 the setpoint is also re-applied whenever the TRV reports something else and at start-up if the TRV disagrees. | when state changes |
 | **Cycle** | How often the node re-evaluates on its own (health checks, heartbeat, override expiry). | `1` min (minimum 1) |
 | **Manual valve** | Off: the TRV knob is ignored; any change on the TRV is pushed back to the scheduled value. On: a change on the TRV becomes a temporary override (capped at *Max setpoint*) and an `override` message is sent on the output for the other valves of the group. A knob turn while a scheduled setpoint is still being applied is also taken as an override; the value of an override that just expired coming back within 30 min is not (a TRV repeating a stale value). | off (recommended) |
+| **Knob settle** | A knob turn is taken once the knob stays still this long (a rotary knob reports each 0.5 °C step). Nothing is pushed back meanwhile. | `20` s |
+| **Knob max wait** | Longest wait before a knob change is taken and shared with the room, even if the knob keeps moving (jittering TRV). | `60` s |
+| **Share with room** | Apply a knob turn to every valve with the same *Group id* (see *Room sync*). | on |
 | **Manual … min duration** | How long an override lasts. When it ends, the scheduled setpoint is restored and pushed to the TRV (0.81 never restored it, and ignored this field). | `60` min |
 
 ### Safety (new in 0.82)
@@ -152,10 +156,12 @@ setpoint. Check that the valve pin moves freely, then recalibrate the TRV."*
 | `msg.payload.command` | Effect |
 |---|---|
 | `set` + `setpoint` (+ optional `temperature`) | New scheduled setpoint (0–40 °C, capped at Max setpoint). During an override it is stored and applied when the override ends. |
-| `override` + `setpoint`, `requestedBy`, `groupId` | Override from another valve of the same group (Manual valve on only). |
+| `override` + `setpoint`, `requestedBy`, `groupId` (+ optional `start`, `duration`) | Override from another valve of the same group (Manual valve on only); same end time when `start`/`duration` are given, duplicates ignored. |
 | `auto` | Back to the schedule, end of any override. |
 | `on` / `off` (or `0`) | Switch the room on / off. Off sends the Off setpoint to the boiler. |
 | `trigger` / `1` | Re-evaluate now. |
+| `away` (optional `value`: `true`/`false`, `"on"`/`"off"`) | Away on (default) or off. See *Away mode*. |
+| `home` | Away off: the latest scheduled setpoint is applied again. |
 
 Messages with `target: "boiler"` (sent by other valves) are ignored.
 
@@ -163,11 +169,43 @@ Messages with `target: "boiler"` (sent by other valves) are ignored.
 
 ```json
 { "command": "set", "target": "boiler", "setpoint": "20.00", "temperature": "19.50",
-  "requestedBy": "SV_CHLOE", "groupId": "52", "health": "OK", "reasons": [] }
+  "requestedBy": "SV_CHLOE", "groupId": "52", "health": "OK", "reasons": [], "away": false }
 ```
 
 Sent when the temperature or setpoint changes, when the health changes, and at least every *Heartbeat*.
 With Manual valve on, a manual change also sends `command: "override"` on the same output, meant for the other valves of the group (the boiler ignores it).
+
+## Manual change and room sync (0.84)
+
+With *Manual valve* on:
+
+1. A knob turn starts a wait of *Knob settle* seconds; each new step (20.5, 21, 21.5…) restarts it, a repeated value does not.
+   Turning back to the current setpoint cancels it. Meanwhile nothing is pushed to the TRV and the boiler demand does not change.
+2. When the knob is still, the last value (capped at *Max setpoint*) becomes an override for *Manual … min duration*.
+3. With *Share with room*, it is published once on `smartheating/group/<Group id>/manual`
+   (`{setpoint, start, duration, groupId, from, requestedBy}`, not retained). Every other valve of that group with Manual valve on
+   (not off, not away) applies it with the **same end time**; receivers never re-publish, and TRV confirmations are not taken as knob turns.
+4. When it ends, every valve goes back to the latest schedule. The override survives Node-RED restarts.
+
+No flow wiring is needed. The `override` message is still sent on the output (older flows wiring valves together keep working;
+a change received twice is applied once). **Group id must be unique per room** with this option: valves of different rooms sharing
+a group id would follow each other. Home Assistant attributes: `override_until`, `knob_settling`.
+
+## Away mode (0.83)
+
+For a room (or the whole house) left empty for a while:
+
+- the TRV gets the **Away setpoint** (frost protection, default 7 °C);
+- the boiler receives the Away setpoint with `away: true`: the room no longer drives the heating, except to keep it above
+  the frost setpoint (smart-boiler lists it under *Rooms away*);
+- the scheduler keeps sending its setpoints, they are recorded and the latest one is applied when back home;
+  a running override is cancelled, a knob turn on the TRV is put back, overrides from the group are ignored;
+- the state is saved (state file) and survives Node-RED restarts and deploys; health checks keep running.
+
+Set it from a flow (`{command:"away"}`, `{command:"home"}`) or from the **Away** switch in Home Assistant
+(e.g. an automation on presence: all valves away when everybody leaves).
+
+To take a valve out of smart-boiler completely (valve removed, room closed), send `remove` to the boiler, see the smart-boiler README.
 
 ## Home Assistant
 
@@ -181,11 +219,12 @@ device **SmartValve <name>** with:
 | Requested setpoint | what the room asks the boiler for (the Off setpoint when FAILED) |
 | Room temperature | from the room sensor |
 | Status detail | plain-language explanation of the state and what to do (first 255 characters; full text in the `status` attribute) |
+| Away (switch) | on = away. Command topic `smartheating/valve/<name>/away/set`, payload `ON` / `OFF` (retained; the node keeps it in line when away is changed from a flow) |
 | Room sensor check, TRV link check, Valve alarm check, TRV tracking check, Setpoint confirmation check | one line per check, e.g. *"OK: 19.0 °C, reported 4 min ago (limit 120 min)."*; attribute `level` = `ok` / `warning` / `waiting` / `failed` / `off` |
 
 All these share the state topic `smartheating/valve/<name>/state`, whose attributes include `reasons`,
 `health_since`, `scheduled_setpoint`, `trv_setpoint`, `trv_temperature`, `trv_age_min`, `sensor_age_min`,
-`valve_alarm`, `override` and `mode`. The device becomes *unavailable* when Node-RED stops.
+`valve_alarm`, `override`, `mode`, `away` and `away_setpoint`. The device becomes *unavailable* when Node-RED stops.
 
 Example alert:
 

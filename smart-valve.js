@@ -69,6 +69,8 @@ module.exports = function(RED) {
         this.allowOverride=truthy(n.allowOverride);                                                     // Allow Manual update from the valve // climate
         this.executionMode=true;
         this.offSp=opt(n.offSp,5);
+        this.awaySp=opt(n.awaySp,7);                                                                     // Frost protection setpoint while away
+        this.away=false;                                                                                // Away: frost protection only, schedule kept for the return
 
         this.temperatureSensorStateTopic=n.temperatureSensorStateTopic;
         this.temperatureSensorKey=n.temperatureSensorKey;
@@ -114,6 +116,16 @@ module.exports = function(RED) {
         this.overrideMode=false;
         // The editor saves this option as "OverrideDuration"; 0.81 read "overrideDuration" and always used 60.
         this.overrideDuration=opt(n.OverrideDuration!==undefined ? n.OverrideDuration : n.overrideDuration,60,true);
+        this.overrideLen=this.overrideDuration;     // minutes of the override in progress (can come from another valve of the room)
+        // 0.84: a knob turn is only taken once the knob stays still for manualSettle seconds (a rotary knob
+        // reports every 0.5 °C step), then shared with the other valves of the same group (room).
+        this.manualSettle=opt(n.manualSettle,20,true);
+        if (this.manualSettle<2) this.manualSettle=2;
+        this.manualMaxWait=opt(n.manualMaxWait,60,true);   // s: a knob that keeps moving is taken and shared after this at most
+        if (this.manualMaxWait<this.manualSettle) this.manualMaxWait=this.manualSettle;
+        this.groupSync = (n.groupSync===undefined || n.groupSync==="") ? true : truthy(n.groupSync);
+        this.manual=null;                           // knob turn waiting to settle {sp, raw, firstTs, lastTs}
+        this.manualTimer=null;
 
         // --- 0.82 options (all minutes unless stated, 0 disables a check) -----------------------------
         this.maxSp=opt(n.maxSp,24);                         // °C ceiling for any setpoint applied or forwarded
@@ -197,6 +209,18 @@ module.exports = function(RED) {
             return a!==undefined && b!==undefined && Math.abs(parseFloat(a)-parseFloat(b))<0.05;
         }
 
+        // Did someone move the knob? A TRV rounds what we send to its step (0.5 °C), so for a setpoint off
+        // that grid a difference up to 0.5 °C is rounding. For a setpoint on the grid any difference is a detent.
+        function knobMoved(v,sp){
+            if (v===undefined || sp===undefined) return false;
+            let g=parseFloat(sp)*2;
+            return Math.abs(g-Math.round(g))<0.02 ? !same(v,sp) : !sameAck(v,sp);
+        }
+
+        function overrideEnd(){
+            return node.overrideStartTs + node.overrideLen*60000;
+        }
+
         // ---------------------------------------------------------------------------------------
         // State persistence
         // ---------------------------------------------------------------------------------------
@@ -210,6 +234,10 @@ module.exports = function(RED) {
                 sp: node.sp,
                 scheduledSp: node.scheduledSp,
                 refTemp: node.refTemp,
+                away: node.away,
+                overrideMode: node.overrideMode,
+                overrideStartTs: node.overrideStartTs,
+                overrideLen: node.overrideLen,
                 timestamp: Date.now()
             };
             node.context().set("valveState", state);
@@ -240,6 +268,15 @@ module.exports = function(RED) {
             node.sp = savedState.sp;
             node.scheduledSp = savedState.scheduledSp!==undefined ? clampSp(savedState.scheduledSp) : undefined;
             node.refTemp = savedState.refTemp;
+            node.away = savedState.away===true;
+            // An override in progress survives a restart and still ends at its time (0.83 forgot it and
+            // kept the manual setpoint until the next schedule change).
+            if (savedState.overrideMode===true && savedState.overrideStartTs){
+                node.overrideStartTs = savedState.overrideStartTs;
+                node.overrideLen = opt(savedState.overrideLen, node.overrideDuration);
+                if (Date.now() < overrideEnd()) node.overrideMode = true;
+                else if (node.scheduledSp!==undefined) node.requestSp = node.scheduledSp;
+            }
             // A restored temperature counts as fresh from startup only: if the sensor stays silent
             // the room becomes FAILED after sensorTimeout instead of trusting it forever.
             node.refTempTs = node.refTemp!==undefined ? moment().valueOf() : 0;
@@ -281,12 +318,14 @@ module.exports = function(RED) {
             if (node.health.state==='FAILED') head = node.failedAction==='failedAction.keep' ? 'FAILED, demand kept (When FAILED = keep).' : 'FAILED: this room no longer asks the boiler for heat.';
             else if (node.health.state==='DEGRADED') head = 'Warning, heating continues normally.';
             else if (node.executionMode==false) head = 'Off: this room does not ask for heat.';
+            else if (node.away) head = `Away: frost protection at ${t(node.awaySp)}, room ${t(node.refTemp)}`+(node.refTemp!==undefined&&parseFloat(node.awaySp)>parseFloat(node.refTemp)?', asking for heat to protect against frost.':', no heat requested.')+(node.requestSp!==undefined?` The schedule (${t(node.requestSp)}) resumes when back home.`:'');
             else if (node.health.state==='UNKNOWN') head = 'Starting.';
             else {
                 let sp=node.requestSp, rt=node.refTemp;
-                head = node.overrideMode ? `OK, manual setpoint ${t(sp)} until ${hhmm(node.overrideStartTs+node.overrideDuration*min)}, room ${t(rt)}.`
+                head = node.overrideMode ? `OK, manual setpoint ${t(sp)} until ${hhmm(overrideEnd())}, room ${t(rt)}.`
                      : `OK, following the schedule: ${t(sp)}, room ${t(rt)}${(sp!==undefined&&rt!==undefined&&parseFloat(sp)>parseFloat(rt))?', asking for heat.':', warm enough.'}`;
             }
+            if (node.manual) parts.unshift(`Knob turned to ${t(node.manual.sp)}: taken in ${Math.max(0,Math.ceil((node.manual.lastTs+node.manualSettle*1000-now)/1000))} s if it stays there.`);
             return [head].concat(parts).join(' ');
         }
 
@@ -417,7 +456,7 @@ module.exports = function(RED) {
                 return;
             }
             let subArray=[];
-            [node.temperatureSensorStateTopic,node.valveSetpointStateTopic,node.valveModeStateTopic].forEach(function(t){
+            [node.temperatureSensorStateTopic,node.valveSetpointStateTopic,node.valveModeStateTopic,ha.enabled?awaySetTopic:undefined,groupTopic].forEach(function(t){
                 if (t && String(t).trim()!="" && !subArray.includes(t)) subArray.push(t);
             });
             try{
@@ -503,15 +542,13 @@ module.exports = function(RED) {
                         node.requestSp=clampSp(valveSp);
                         flgProcess=true;
                     }
-                    else if ((node.trv.pendingAck || node.trv.noAck) && node.allowOverride==true && node.executionMode==true && !guard &&
+                    else if ((node.trv.pendingAck || node.trv.noAck) && node.allowOverride==true && node.executionMode==true && !guard && !node.away &&
                              node.trv.pendingAck && node.trv.pendingAck.prev!==undefined && !sameAck(valveSp,node.trv.pendingAck.prev)){
                         // A value that is neither what we sent nor what the TRV had before: someone turned the knob
                         // while we were waiting. Accept it as a manual change (Manual valve on).
                         nlog(`TRV changed by hand to ${valveSp}°C while ${node.trv.pendingAck.sp}°C was being applied`,"info");
                         node.trv.pendingAck=null; node.trv.noAck=false; node.trv.retryNow=false;
-                        node.requestSp=clampSp(valveSp);
-                        node.sp=undefined;                    // evaluate() treats the difference as an override
-                        flgProcess=true;
+                        manualKnob(valveSp);
                     }
                     else if (node.trv.pendingAck || node.trv.noAck){
                         // Waiting for (or never got) the TRV to confirm our setpoint: whatever else it
@@ -524,14 +561,16 @@ module.exports = function(RED) {
                         node.driftPending=true; node.driftForce=true;
                         flgProcess=true;
                     }
-                    else if (node.sp!==undefined && !sameAck(valveSp,node.sp)){
-                        if (node.allowOverride==true && node.executionMode==true){
-                            // Manual change on the TRV, accepted as an override (capped). evaluate() handles it.
-                            let v=clampSp(valveSp);
-                            if (!same(v,node.requestSp)){
-                                node.requestSp=v;
-                                flgProcess=true;
-                            }
+                    else if (node.sp!==undefined && knobMoved(valveSp,node.sp)){
+                        if (node.away && node.executionMode==true){
+                            // Away: nobody is supposed to be there, keep the frost protection setpoint.
+                            nlog(`TRV reports ${valveSp}°C while away (${node.sp}°C) -> re-applying`,"warn");
+                            node.driftPending=true; node.driftForce=true;
+                            flgProcess=true;
+                        }
+                        else if (node.allowOverride==true && node.executionMode==true){
+                            // Manual change on the TRV: taken as an override once the knob stays still.
+                            manualKnob(valveSp);
                         }
                         else if (node.executionMode==true){
                             // Manual valve disabled: the TRV is out of line. Never forward it, put ours back.
@@ -539,6 +578,9 @@ module.exports = function(RED) {
                             node.driftPending=true;
                             flgProcess=true;
                         }
+                    }
+                    else if (node.manual && node.sp!==undefined && !knobMoved(valveSp,node.sp)){
+                        cancelManual('knob turned back to '+valveSp+'°C');
                     }
                 }
             }
@@ -604,6 +646,10 @@ module.exports = function(RED) {
         const uid = 'smartvalve_'+String(node.id).replace(/[^a-zA-Z0-9]/g,'');
         const stateTopic = `${ha.base}/valve/${slug(node.name)}/state`;
         const availTopic = `${ha.base}/valve/${slug(node.name)}/availability`;
+        const awaySetTopic = `${ha.base}/valve/${slug(node.name)}/away/set`;
+        // Valves of one room (same group id) share manual changes on this topic, without any flow wiring.
+        const hasGroup = node.groupId!==undefined && node.groupId!==null && String(node.groupId).trim()!=='';
+        const groupTopic = (node.groupSync && hasGroup) ? `${ha.base}/group/${slug(String(node.groupId))}/manual` : null;
 
         function haDiscovery(){
             if (!ha.enabled) return;
@@ -614,6 +660,9 @@ module.exports = function(RED) {
                 ['binary_sensor','problem',Object.assign({name:'Problem',unique_id:uid+'_problem',device_class:'problem',value_template:"{{ 'ON' if value_json.health in ['FAILED','DEGRADED'] else 'OFF' }}"},common)],
                 ['sensor','setpoint',Object.assign({name:'Requested setpoint',unique_id:uid+'_setpoint',device_class:'temperature',unit_of_measurement:'°C',value_template:'{{ value_json.boiler_setpoint }}'},common)],
                 ['sensor','temperature',Object.assign({name:'Room temperature',unique_id:uid+'_temperature',device_class:'temperature',unit_of_measurement:'°C',value_template:'{{ value_json.temperature }}'},common)],
+                ['switch','away',Object.assign({},common,{name:'Away',unique_id:uid+'_away',icon:'mdi:home-export-outline',
+                    value_template:"{{ 'ON' if value_json.away else 'OFF' }}",command_topic:awaySetTopic,
+                    payload_on:'ON',payload_off:'OFF',state_on:'ON',state_off:'OFF',retain:true})],
                 ['sensor','status',Object.assign({name:'Status detail',unique_id:uid+'_status',icon:'mdi:information-outline',value_template:'{{ value_json.status[:255] }}'},common)],
             ];
             [['sensor','Room sensor check','mdi:thermometer-check'],['trv_link','TRV link check','mdi:access-point-check'],
@@ -648,7 +697,11 @@ module.exports = function(RED) {
                 trv_age_min:node.trv.lastMsgTs?Math.round((now-node.trv.lastMsgTs)/60000):null,
                 valve_alarm:node.trv.alarm,
                 override:node.overrideMode,
+                override_until:node.overrideMode?new Date(overrideEnd()).toISOString():null,
+                knob_settling:node.manual?node.manual.sp:null,
                 mode:node.executionMode?'on':'off',
+                away:node.away,
+                away_setpoint:parseFloat(node.awaySp),
                 group:node.groupId
             };
             const s=JSON.stringify(st);
@@ -666,7 +719,7 @@ module.exports = function(RED) {
         // ---------------------------------------------------------------------------------------
 
         function checkOverrideExpiry(){
-            if (node.overrideMode==true && moment().valueOf()-node.overrideStartTs>(node.overrideDuration*60000)){
+            if (node.overrideMode==true && moment().valueOf()>overrideEnd()){
                 nlog("Override duration expired, back to the schedule","info");
                 node.overrideMode=false;
                 node.expiredOverride={sp:node.requestSp, ts:moment().valueOf()};
@@ -675,6 +728,137 @@ module.exports = function(RED) {
                     node.inputTrigger=true;          // forces the scheduled setpoint to be pushed to the TRV
                 }
             }
+        }
+
+        // Away: frost protection setpoint on the TRV, the room only asks the boiler for heat below it,
+        // the schedule keeps being recorded and is applied again when back home.
+        function setAway(on, why){
+            on=!!on;
+            if (on===node.away){
+                haState(node.prevSp, true); sendMqtt();
+                return;
+            }
+            node.away=on;
+            nlog(`${on?'Away':'Back home'} (${why})`,"info");
+            if (on) cancelManual('away');
+            if (on && node.overrideMode){
+                node.overrideMode=false;                  // a manual setpoint does not survive leaving
+                if (node.scheduledSp!==undefined) node.requestSp=node.scheduledSp;
+            }
+            // Keep the retained Home Assistant command in line, so a restart never replays an old one.
+            if (ha.enabled) node.mqttstack.push({topic:awaySetTopic,payload:on?'ON':'OFF',qos:1,retain:true});
+            node.inputTrigger=true;                       // push the new TRV setpoint now
+            node.lastBoilerSendTs=0;                      // and tell the boiler straight away
+            saveState();
+            evaluate();
+            haState(node.prevSp, true); sendMqtt();
+        }
+        function awayValue(v){
+            if (v===undefined || v===null) return undefined;
+            if (typeof v==='object') v=v.away!==undefined ? v.away : (v.state!==undefined ? v.state : v.value);
+            if (typeof v==='boolean') return v;
+            v=String(v).trim().toLowerCase();
+            if (/^(on|1|true|away|yes)$/.test(v)) return true;
+            if (/^(off|0|false|home|no)$/.test(v)) return false;
+            return undefined;
+        }
+
+        // ---------------------------------------------------------------------------------------
+        // Manual change (knob) and room synchronisation
+        // ---------------------------------------------------------------------------------------
+
+        function startOverride(sp, startTs, len){
+            node.overrideMode=true;
+            node.overrideStartTs=startTs;
+            node.overrideLen=len;
+            node.requestSp=sp;
+        }
+
+        // A rotary knob reports every step (20.5, 21, 21.5...). Wait until it stays still for manualSettle s,
+        // then take the last value once. A knob that never settles (jittering TRV) is taken after manualMaxWait s.
+        function manualKnob(valveSp){
+            let v=clampSp(valveSp), now=moment().valueOf();
+            if (v===undefined) return;
+            if (node.manual && same(node.manual.sp,v) && same(node.manual.raw,valveSp)) return;   // same value repeated: no extension
+            if (!node.manual){
+                node.manual={sp:v, raw:parseFloat(valveSp), firstTs:now, lastTs:now};
+                nlog(`Knob turned to ${valveSp}°C, waiting ${node.manualSettle}s for it to settle`,"info");
+            }
+            node.manual.sp=v; node.manual.raw=parseFloat(valveSp); node.manual.lastTs=now;
+            clearTimeout(node.manualTimer);
+            let wait=Math.min(node.manualSettle*1000, node.manual.firstTs+node.manualMaxWait*1000-now);
+            node.manualTimer=setTimeout(commitManual, Math.max(0,wait));
+            setStatus(node.prevSp);
+        }
+
+        function cancelManual(why){
+            if (!node.manual) return;
+            nlog(`Knob change cancelled (${why})`,"info");
+            clearTimeout(node.manualTimer); node.manualTimer=null;
+            node.manual=null;
+            setStatus(node.prevSp);
+        }
+
+        function commitManual(){
+            node.manualTimer=null;
+            let m=node.manual;
+            node.manual=null;
+            if (!m) return;
+            if (!(node.allowOverride==true && node.executionMode==true && !node.away)) return;
+            let now=moment().valueOf();
+            nlog(`Manual setpoint ${m.sp}°C taken for ${node.overrideDuration} min`+(groupTopic?`, shared with group ${node.groupId}`:''),"info");
+            startOverride(m.sp, now, node.overrideDuration);
+            node.sp=m.raw;                               // what the TRV has now; evaluate() caps it if needed
+            if (groupTopic){
+                node.mqttstack.push({topic:groupTopic,qos:1,retain:false,payload:{
+                    setpoint:m.sp, start:now, duration:node.overrideLen, groupId:node.groupId,
+                    from:node.id, requestedBy:node.name}});
+            }
+            // Kept for flows that wire the output to the other valves (0.81/0.82 way); they ignore duplicates.
+            node.send([{topic:node.topic,payload:{
+                command:"override", setpoint:parseFloat(parseFloat(m.sp).toFixed(2)),
+                temperature:node.refTemp!==undefined?parseFloat(parseFloat(node.refTemp).toFixed(2)):undefined,
+                requestedBy:node.name, groupId:node.groupId, start:now, duration:node.overrideLen, from:node.id, noOut:true}}]);
+            node.inputTrigger=true;
+            evaluate();
+        }
+
+        // Manual change made on another valve of the same group: same setpoint, same end time.
+        function applyGroupOverride(p, via){
+            if (!p || typeof p!=='object') return false;
+            if (p.from===node.id || (p.requestedBy!==undefined && p.requestedBy==node.name)) return false;
+            if (!hasGroup || p.groupId===undefined || String(p.groupId)!==String(node.groupId)){
+                nlog(`Override from ${p.requestedBy} (group ${p.groupId}) via ${via}: other group, ignored`,"debug");
+                return false;
+            }
+            if (!(node.allowOverride==true && node.executionMode==true)){
+                nlog(`Override from ${p.requestedBy} via ${via} ignored (manual valve disabled or off)`,"debug");
+                return false;
+            }
+            if (node.away){
+                nlog(`Override from ${p.requestedBy} via ${via} ignored while away`,"debug");
+                return false;
+            }
+            let sp=parseFloat(p.setpoint);
+            if (p.setpoint===undefined || p.setpoint===null || isNaN(sp) || sp<0 || sp>40){
+                nlog(`Override from ${p.requestedBy} via ${via}: invalid setpoint ${p.setpoint}`,"warn");
+                return false;
+            }
+            sp=clampSp(sp);
+            let now=moment().valueOf();
+            let start=parseFloat(p.start);
+            if (isNaN(start) || start>now+60000 || start<now-10*60000) start=now;
+            let len=parseFloat(p.duration);
+            if (isNaN(len) || len<=0 || len>24*60) len=node.overrideDuration;
+            if (now>=start+len*60000) return false;      // already over
+            // The same change received twice (MQTT and flow wiring): applied once.
+            if (node.overrideMode && same(node.requestSp,sp) && Math.abs(node.overrideStartTs-start)<120000) return false;
+            if (node.manual) cancelManual('override from '+p.requestedBy);
+            nlog(`Override ${sp}°C from ${p.requestedBy} (via ${via}) until ${moment(start+len*60000).format('HH:mm')}`,"info");
+            startOverride(sp, start, len);
+            node.inputTrigger=true;
+            evaluate();
+            return true;
         }
 
         node.on('input', function(msg) {
@@ -691,11 +875,22 @@ module.exports = function(RED) {
                 return;
             }
             command=String(command);
-            if (!command.match(/^(1|set|on|auto|0|off|trigger|override)$/i)){
+            if (!command.match(/^(1|set|on|auto|0|off|trigger|override|away|home)$/i)){
                 nlog('unhandled msg.payload:'+JSON.stringify(msg.payload),"debug");
                 return;
             }
             command=command.toLowerCase();
+
+            if (command=='away' || command=='home'){
+                let v = command=='home' ? false : (msg.payload.value===undefined ? true : awayValue(msg.payload.value));
+                if (v===undefined){
+                    nlog(`Command:away invalid value ${JSON.stringify(msg.payload.value)}`,"error");
+                    return;
+                }
+                if (msg.payload.noOut===true) node.noOut=true;
+                setAway(v,'input');
+                return;
+            }
 
             if (command=='0' || command=='off'){
                 node.executionMode=false;
@@ -722,16 +917,13 @@ module.exports = function(RED) {
                 }
 
                 if (command=='override'){
-                    if (!(node.allowOverride==true && node.executionMode==true && msg.payload.requestedBy!==undefined && msg.payload.groupId!==undefined)){
-                        nlog("Command:override ignored (manual valve disabled or incomplete message)","debug");
+                    if (msg.payload.requestedBy===undefined || msg.payload.groupId===undefined){
+                        nlog("Command:override ignored (incomplete message)","debug");
                         return;
                     }
-                    if (msg.payload.requestedBy==node.name || msg.payload.groupId!=node.groupId){
-                        nlog("Command:override from itself or another group -> ignoring","debug");
-                        return;
-                    }
-                    node.overrideStartTs=moment().valueOf();
-                    node.overrideMode=true;
+                    node.inputLastTs=moment().valueOf();
+                    applyGroupOverride(msg.payload,'input');
+                    return;
                 }
 
                 if (command=='set'){
@@ -778,11 +970,17 @@ module.exports = function(RED) {
                 node.status({fill:'grey',shape:'dot',text:`Off t:${t}°C, sp:${sp}°C`});
                 return;
             }
+            if (node.away){
+                let deg=node.health.state==='DEGRADED' ? `(${node.health.reasons.join(', ')}) ` : '';
+                node.status({fill:'blue',shape:'dot',text:`${deg}Away t:${t}°C, sp:${sp}°C`});
+                return;
+            }
             let prefix='';
             if (node.overrideMode){
-                let left=Math.max(0,Math.ceil((node.overrideStartTs+(node.overrideDuration*60000)-moment().valueOf())/60000));
+                let left=Math.max(0,Math.ceil((overrideEnd()-moment().valueOf())/60000));
                 prefix=`(Manual ${left}min left) `;
             }
+            if (node.manual) prefix=`(Knob ${parseFloat(node.manual.sp).toFixed(1)}°C settling) `+prefix;
             if (node.health.state==='DEGRADED') prefix+=`(${node.health.reasons.join(', ')}) `;
             let heat=parseFloat(boilerSp)>parseFloat(node.refTemp);
             node.status({fill: node.health.state==='DEGRADED' ? 'yellow' : (heat?'red':'green'), shape:'dot', text:`${prefix}${heat?'Heat':'idle'} t:${t}°C, sp:${sp}°C`});
@@ -803,7 +1001,7 @@ module.exports = function(RED) {
             checkOverrideExpiry();
             let healthChanged=computeHealth(now);
 
-            if (node.refTemp===undefined || node.requestSp===undefined){
+            if (node.refTemp===undefined || (node.requestSp===undefined && !node.away)){
                 let t=node.refTemp!==undefined ? node.refTemp : "?";
                 let sp=node.requestSp!==undefined ? node.requestSp : "?";
                 node.status({fill:'yellow',shape:'dot',text:`Not ready t:${t}°C, sp:${sp}°C`});
@@ -814,47 +1012,31 @@ module.exports = function(RED) {
             }
 
             // --- Setpoint towards the TRV ------------------------------------------------------
-            if (node.executionMode==true){
+            const target = node.away ? node.awaySp : node.requestSp;     // what the TRV should have now
+            if (node.executionMode==true && !node.manual){                // never fight a knob being turned
                 if (node.firstEval==true && node.inputTrigger==false){
                     // Startup: adopt the saved/known setpoint and make sure the TRV has it.
-                    if (node.sp===undefined || !same(node.sp,node.requestSp) || (node.trv.lastSp!==undefined && !same(node.trv.lastSp,node.requestSp))){
-                        pushSetpointToTrv(node.requestSp,'startup');
+                    if (node.sp===undefined || !same(node.sp,target) || (node.trv.lastSp!==undefined && !same(node.trv.lastSp,target))){
+                        pushSetpointToTrv(target,'startup');
                     } else {
-                        node.sp=node.requestSp;
+                        node.sp=target;
                     }
                 }
-                else if (node.inputTrigger==false && node.allowOverride==true && node.firstEval==false && !same(node.sp,node.requestSp)){
-                    // Manual change accepted from the TRV.
-                    nlog("Manual update from the valve detected","info");
-                    if (node.noOut==false){
-                        node.send([{
-                            topic:node.topic,
-                            payload:{
-                                command:"override",
-                                setpoint:parseFloat(parseFloat(node.requestSp).toFixed(2)),
-                                temperature:parseFloat(parseFloat(node.refTemp).toFixed(2)),
-                                requestedBy:node.name,
-                                groupId:node.groupId,
-                                noOut:true
-                            }
-                        }]);
-                    }
-                    node.overrideMode=true;
-                    node.overrideStartTs=now;
-                    node.sp=node.requestSp;
-                    if (node.trv.lastSp!==undefined && !same(node.trv.lastSp,node.requestSp)){
-                        pushSetpointToTrv(node.requestSp,'override capped');
-                    }
-                }
-                else if ((node.inputTrigger==true && !same(node.sp,node.requestSp)) || node.spUpdateMode=="spUpdateMode.cycle"){
-                    pushSetpointToTrv(node.requestSp, node.inputTrigger?'schedule':'cycle');
+                else if ((node.inputTrigger==true && !same(node.sp,target)) || node.spUpdateMode=="spUpdateMode.cycle"){
+                    pushSetpointToTrv(target, node.away?'away':(node.inputTrigger?'schedule':'cycle'));
                 }
 
                 if (node.driftPending==true){
-                    if ((node.allowOverride!=true || node.driftForce) && node.sp!==undefined && now-node.trv.lastPushTs>=60000){
-                        pushSetpointToTrv(node.sp,'TRV out of line');
+                    if ((node.allowOverride!=true || node.driftForce) && node.sp!==undefined){
+                        // At most one correction a minute; a change seen sooner stays pending for the next cycle
+                        // (it used to be dropped, leaving a knob turned right after a push in place).
+                        if (now-node.trv.lastPushTs>=60000){
+                            pushSetpointToTrv(node.sp,'TRV out of line');
+                            node.driftPending=false; node.driftForce=false;
+                        }
+                    } else {
+                        node.driftPending=false; node.driftForce=false;
                     }
-                    node.driftPending=false; node.driftForce=false;
                 }
 
                 // First confirmation missed: send the same setpoint once more before calling it a failure.
@@ -868,8 +1050,8 @@ module.exports = function(RED) {
                 // Never confirmed: retry every 3 x ackTimeout so a recovered TRV gets back in line.
                 if (node.trv.noAck && node.ackTimeout>0 && now-node.trv.lastPushTs>=3*node.ackTimeout*60000){
                     node.trv.pendingAck=null;
-                    pushSetpointToTrv(node.requestSp,'retry');
-                    node.trv.pendingAck={sp:parseFloat(node.requestSp),ts:now};
+                    pushSetpointToTrv(target,'retry');
+                    node.trv.pendingAck={sp:parseFloat(target),ts:now};
                 }
             }
 
@@ -883,7 +1065,8 @@ module.exports = function(RED) {
             }
 
             // --- Demand towards the boiler ----------------------------------------------------
-            let boilerSp = (node.executionMode==false || releasesDemand()) ? node.offSp : node.requestSp;
+            // Away: only frost protection, the room asks for heat when it falls below the away setpoint.
+            let boilerSp = (node.executionMode==false || releasesDemand()) ? node.offSp : (node.away ? node.awaySp : node.requestSp);
             let heartbeatDue = node.heartbeat>0 && now-node.lastBoilerSendTs>=node.heartbeat*60000;
             if (node.refTemp!=node.prevRefTemp || !same(boilerSp,node.prevSp) || node.firstEval==true || heartbeatDue || healthChanged){
                 if (node.noOut==false){
@@ -895,7 +1078,8 @@ module.exports = function(RED) {
                         requestedBy:node.name,
                         groupId:node.groupId,
                         health:node.health.state,
-                        reasons:node.health.reasons
+                        reasons:node.health.reasons,
+                        away:node.away
                     }}]);
                     node.lastBoilerSendTs=now;
                 }
@@ -947,6 +1131,14 @@ module.exports = function(RED) {
                 sendMqtt();
             });
             node.mqttclient.on('message', (topic, payload) => {
+                if (ha.enabled && topic===awaySetTopic){
+                    let v=payload.toString(), j;
+                    try{ j=JSON.parse(v); }catch(e){ j=v; }
+                    let a=awayValue(j);
+                    if (a===undefined){ nlog(`Away command ignored: ${v}`,"warn"); return; }
+                    try{ setAway(a,'Home Assistant'); }catch(e){ node.error("Error processing away command: "+e.message); }
+                    return;
+                }
                 let obj;
                 try{
                     obj=JSON.parse(payload.toString());
@@ -955,6 +1147,10 @@ module.exports = function(RED) {
                     return;
                 }
                 if (obj===null || typeof obj!=='object') return;
+                if (groupTopic && topic===groupTopic){
+                    try{ applyGroupOverride(obj,'MQTT'); }catch(e){ node.error("Error processing group manual change: "+e.message); }
+                    if (topic!==node.temperatureSensorStateTopic && topic!==node.valveSetpointStateTopic && topic!==node.valveModeStateTopic) return;
+                }
                 try{
                     callbackMqtt(topic,obj);
                 }catch(e){
@@ -967,6 +1163,7 @@ module.exports = function(RED) {
         node.startTimeout = setTimeout(evaluate, 1000);
 
         node.on('close', function(done) {
+            clearTimeout(node.manualTimer);
             clearInterval(node.evalInterval);
             clearTimeout(node.startTimeout);
             if (node.mqttclient) {
