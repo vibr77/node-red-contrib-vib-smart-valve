@@ -269,7 +269,7 @@
     </div>
     <div class="form-row">
         <label for="node-input-windowStateTopic"><i class="fa fa-window-maximize">&nbsp;</i>[state]</label>
-        <input type="text" id="node-input-windowStateTopic" placeholder="zigbee2mqtt/WINDOW_SALON (empty = no sensor)">
+        <input type="text" id="node-input-windowStateTopic" placeholder="zigbee2mqtt/DS_ROOM_W, zigbee2mqtt/DS_ROOM_E (empty = none)" title="One or several sensor topics, separated by commas: the room is paused while any of them is open">
     </div>
     <div class="form-row">
         <label for="node-input-windowKey"><i class="fa fa-key">&nbsp;</i>[key]</label>
@@ -689,6 +689,8 @@
        so the whole room returns to the schedule together. No flow wiring is needed; the <code>override</code> message is still sent
        on the output for older flows, duplicates are ignored. An override survives a restart. Group id must then be unique per room.</p>
     <h3>Window sensor (0.85)</h3>
+    <p>Several sensors (one per window of the room) can be listed, separated by commas: the room is paused while <b>any</b> of them
+       has been open longer than the delay, and resumes when <b>all</b> are closed; each sensor has its own delay and silence timeout (0.86).</p>
     <p>With a <b>Window sensor</b> topic (e.g. an Aqara contact sensor in Zigbee2MQTT: key <code>contact</code>, open when <code>false</code>),
        a window open for more than <b>Open delay</b> (default 60 s) stops the heating of the room: the TRV gets the Away setpoint (frost protection)
        and the boiler receives it with <code>window:true</code>. When it closes, the current schedule is applied at once; a manual override in
@@ -697,7 +699,7 @@
        every 5 min while open, forgotten 15 min after the valve went silent), so one sensor is enough for a room. A sensor silent for more than
        the timeout (default 180 min) is taken as closed. An open window is not a fault (health stays OK) and survives a restart.
        Also settable from a flow: <code>{command:"window", value:true|false}</code>. Home Assistant: <b>Window</b> binary sensor, attributes
-       <code>window</code>, <code>window_since</code>, <code>window_source</code>.</p>
+       <code>window</code>, <code>window_since</code>, <code>window_source</code>, <code>window_sensors</code> (the open ones).</p>
     <h3>Away (0.83)</h3>
     <p><code>{command:"away"}</code> (or <code>{command:"away", value:false}</code> / <code>{command:"home"}</code>), or the
        <b>Away</b> switch in Home Assistant (topic <code>smartheating/valve/&lt;name&gt;/away/set</code>, payload <code>ON</code>/<code>OFF</code>).</p>

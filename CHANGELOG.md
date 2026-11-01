@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.86.0 — 2026-11-01
+
+- Several window sensors per valve: the topic field takes a list (commas, semicolons, spaces or new lines). The room is paused
+  while any window has been open longer than the delay and resumes when all are closed; each sensor has its own delay and
+  silence timeout; the open ones survive a restart. Home Assistant attribute `window_sensors` and status detail name them.
+
 ## 0.85.0 — 2026-11-01
 
 - Window sensor (optional topic, key `contact`, open when `false`): a window open for more than 60 s stops the heating of the

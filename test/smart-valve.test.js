@@ -926,8 +926,121 @@ describe('smart-valve 0.82', function () {
             const st = JSON.parse(H.broker.retained['smartheating/valve/lou/state']);
             assert.strictEqual(st.window, true);
             assert.strictEqual(st.window_source, 'sensor');
-            assert.match(st.status, /^Window open since \d\d:\d\d: heating paused, frost protection at 7\.0 °C/);
+            assert.match(st.status, /^Window open since \d\d:\d\d \(WIN_LOU\): heating paused, frost protection at 7\.0 °C/);
+            assert.deepStrictEqual(st.window_sensors, ['WIN_LOU']);
             assert.strictEqual(st.health, 'OK', 'an open window is not a fault');
+        });
+    });
+
+    describe('Several window sensors per valve (0.86)', function () {
+        const T = (n) => `zigbee2mqtt/${n}`;
+        const ds = (n, open) => H.broker.publish(T(n), JSON.stringify({ contact: !open, battery: 100 }));
+        const two = (name, extra = {}) => settledRoom(name, { cfg: Object.assign({ windowStateTopic: `${T('DS_' + name + '_W')}, ${T('DS_' + name + '_E')}` }, extra) });
+        const sp = (r) => r.trv.state.occupied_heating_setpoint;
+
+        it('M-01 two windows: paused while any is open, resumes only when both are closed', function () {
+            const r = two('CHLOE');
+            ds('DS_CHLOE_W', true); sec(65);
+            assert.strictEqual(sp(r), 7);
+            ds('DS_CHLOE_E', true); sec(65);
+            ds('DS_CHLOE_W', false); sec(5);
+            assert.strictEqual(sp(r), 7, 'E still open');
+            assert.strictEqual(lastBoiler(r.v).window, true);
+            ds('DS_CHLOE_E', false); sec(5);
+            assert.strictEqual(sp(r), 20);
+            assert.strictEqual(lastBoiler(r.v).window, false);
+        });
+
+        it('M-02 each sensor has its own delay: a short opening of one never adds to another', function () {
+            const r = two('ARTHUR');
+            ds('DS_ARTHUR_W', true); sec(40); ds('DS_ARTHUR_W', false);      // 40 s: under the delay
+            sec(10); ds('DS_ARTHUR_E', true); sec(40);                       // E open for 40 s, W closed
+            assert.strictEqual(sp(r), 20, 'no window open for 60 s yet');
+            sec(25);
+            assert.strictEqual(sp(r), 7, 'E open for 65 s');
+        });
+
+        it('M-03 a brief opening of the second window while the first is already open changes nothing', function () {
+            const r = two('CHLOE');
+            ds('DS_CHLOE_W', true); sec(65);
+            const n = r.trv.sets.length;
+            ds('DS_CHLOE_E', true); sec(20); ds('DS_CHLOE_E', false); sec(60);
+            assert.strictEqual(sp(r), 7);
+            assert.strictEqual(r.trv.sets.filter(x => x.key === 'occupied_heating_setpoint').length,
+                               r.trv.sets.slice(0, n).filter(x => x.key === 'occupied_heating_setpoint').length, 'no extra push');
+            ds('DS_CHLOE_W', false); sec(5);
+            assert.strictEqual(sp(r), 20);
+        });
+
+        it('M-04 a silent sensor stuck open is dropped after 3 h, the other one still works', function () {
+            const r = two('CHLOE');
+            ds('DS_CHLOE_W', true); sec(65);
+            for (let i = 0; i < 4; i++) { ds('DS_CHLOE_E', false); min(50); }  // E keeps reporting, W silent
+            assert.strictEqual(sp(r), 20, 'W silent for more than 180 min: taken as closed');
+            ds('DS_CHLOE_E', true); sec(65);
+            assert.strictEqual(sp(r), 7, 'E opening still pauses the room');
+            ds('DS_CHLOE_E', false); sec(5);
+            assert.strictEqual(sp(r), 20);
+            ds('DS_CHLOE_W', false); sec(5);                                   // W comes back, closed
+            assert.strictEqual(sp(r), 20);
+        });
+
+        it('M-05 restart with two windows open: both remembered, closed one by one', async function () {
+            const r = two('ARTHUR');
+            ds('DS_ARTHUR_W', true); ds('DS_ARTHUR_E', true); sec(65);
+            r.th.stop(); await RED.close(r.v); rooms = [];
+            const v = RED.create('smart-valve', H.valveConfig('v_ARTHUR', 'ARTHUR', { windowStateTopic: `${T('DS_ARTHUR_W')}, ${T('DS_ARTHUR_E')}` }));
+            const th = new H.Sensor('zigbee2mqtt/TH_ARTHUR', 19, 20).start();
+            rooms.push({ v, th, trv: r.trv });
+            sec(5);
+            assert.strictEqual(v.window.eff, true);
+            ds('DS_ARTHUR_W', false); sec(5);
+            assert.strictEqual(r.trv.state.occupied_heating_setpoint, 7, 'E still open');
+            ds('DS_ARTHUR_E', false); sec(5);
+            assert.strictEqual(r.trv.state.occupied_heating_setpoint, 20);
+        });
+
+        it('M-06 topic list: commas, semicolons, spaces, new lines and duplicates; one subscription each', function () {
+            const list = ` ${T('DS_A')},${T('DS_B')} ; ${T('DS_C')}\n${T('DS_A')}  ${T('DS_D')} `;
+            const r = settledRoom('LOU', { cfg: { windowStateTopic: list } });
+            assert.deepStrictEqual(r.v.windowTopics, [T('DS_A'), T('DS_B'), T('DS_C'), T('DS_D')]);
+            ['DS_A', 'DS_B', 'DS_C', 'DS_D'].forEach(n =>
+                assert.strictEqual(H.broker.subs.filter(x => x.topic === T(n) && x.client !== undefined && x.client.opts).length, 1, n));
+            ds('DS_D', true); sec(65);
+            assert.strictEqual(sp(r), 7);
+            ds('DS_D', false); sec(5);
+            assert.strictEqual(sp(r), 20);
+        });
+
+        it('M-07 a window opened from a flow and a sensor are independent', function () {
+            const r = two('CHLOE');
+            RED.input(r.v, { payload: { command: 'window', value: true } }); sec(5);
+            assert.strictEqual(sp(r), 7);
+            ds('DS_CHLOE_W', true); sec(65); ds('DS_CHLOE_W', false); sec(5);
+            assert.strictEqual(sp(r), 7, 'still open from the flow');
+            RED.input(r.v, { payload: { command: 'window', value: false } }); sec(5);
+            assert.strictEqual(sp(r), 20);
+        });
+
+        it('M-08 room of two valves, one window each: the room resumes only when both windows are closed', function () {
+            const banc = settledRoom('CUISINE_BANC', { cfg: { groupId: '4', windowStateTopic: T('DS_CUISINE_WINDOW_LEFT') } });
+            const plan = settledRoom('CUISINE_PLAN', { cfg: { groupId: '4', windowStateTopic: T('DS_CUISINE_WINDOW_MID') } });
+            ds('DS_CUISINE_WINDOW_MID', true); sec(65);
+            assert.strictEqual(sp(banc), 7); assert.strictEqual(sp(plan), 7);
+            ds('DS_CUISINE_WINDOW_LEFT', true); sec(65);
+            ds('DS_CUISINE_WINDOW_MID', false); sec(5);
+            assert.strictEqual(sp(banc), 7); assert.strictEqual(sp(plan), 7, 'LEFT still open (shared by the room)');
+            ds('DS_CUISINE_WINDOW_LEFT', false); sec(5);
+            assert.strictEqual(sp(banc), 20); assert.strictEqual(sp(plan), 20);
+        });
+
+        it('M-09 Home Assistant and status name the open windows', function () {
+            load({ haDiscovery: true });
+            two('CHLOE');
+            ds('DS_CHLOE_W', true); ds('DS_CHLOE_E', true); sec(65);
+            const st = JSON.parse(H.broker.retained['smartheating/valve/chloe/state']);
+            assert.deepStrictEqual(st.window_sensors.sort(), ['DS_CHLOE_E', 'DS_CHLOE_W']);
+            assert.match(st.status, /^Window open since \d\d:\d\d \((DS_CHLOE_W, DS_CHLOE_E|DS_CHLOE_E, DS_CHLOE_W)\)/);
         });
     });
 });

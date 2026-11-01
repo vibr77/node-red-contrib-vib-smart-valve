@@ -129,12 +129,17 @@ module.exports = function(RED) {
 
         // 0.85: window/door contact sensor. While a window of the room is open the room is not heated
         // (frost protection at the away setpoint); the schedule comes back as soon as it closes.
-        this.windowStateTopic = (n.windowStateTopic && String(n.windowStateTopic).trim()!=='') ? String(n.windowStateTopic).trim() : undefined;
+        // 0.86: one or several sensors (topics separated by commas, semicolons, spaces or new lines).
+        this.windowTopics = String(n.windowStateTopic||'').split(/[\s,;]+/).map(function(t){return t.trim();})
+            .filter(function(t,i,a){ return t!=='' && a.indexOf(t)===i; });
+        this.windowStateTopic = this.windowTopics.length ? this.windowTopics.join(', ') : undefined;
         this.windowKey = (n.windowKey && String(n.windowKey).trim()!=='') ? String(n.windowKey).trim() : 'contact';
         this.windowOpenValue = (n.windowOpenValue!==undefined && String(n.windowOpenValue).trim()!=='') ? String(n.windowOpenValue).trim() : 'false';
         this.windowOpenDelay = opt(n.windowOpenDelay,60,true);      // s the window must stay open before heating stops
         this.windowTimeout = opt(n.windowTimeout,180,true);         // min without news from the sensor -> taken as closed (0 = never)
-        this.window = {own:false, ownSince:0, rawOpen:false, lastMsgTs:0, timer:null, peers:{}, eff:false, effSince:0, lastPubTs:0, stale:false};
+        // sensors: per topic (and 'input' for the flow command) {raw, open, since, lastMsgTs, timer, stale}
+        this.window = {sensors:{}, own:false, ownSince:0, peers:{}, eff:false, effSince:0, lastPubTs:0};
+        this.windowTopics.forEach(function(t){ this.window.sensors[t]={raw:false, open:false, since:0, lastMsgTs:0, timer:null, stale:false}; }, this);
 
         // --- 0.82 options (all minutes unless stated, 0 disables a check) -----------------------------
         this.maxSp=opt(n.maxSp,24);                         // °C ceiling for any setpoint applied or forwarded
@@ -232,16 +237,22 @@ module.exports = function(RED) {
 
         // Window: open according to this valve's sensor (fresh enough) or to another valve of the room.
         const PEER_TTL = 15*60000;
-        function ownWindowOpen(now){
-            if (!node.window.own) return false;
-            if (node.windowTimeout>0 && now-node.window.lastMsgTs>node.windowTimeout*60000){
-                if (!node.window.stale) nlog(`Window sensor silent for more than ${node.windowTimeout} min: taken as closed`,"warn");
-                node.window.stale=true;
-                return false;
-            }
-            node.window.stale=false;
-            return true;
+        function sensorName(k){ return k==='input' ? 'input' : String(k).split('/').pop(); }
+        // This valve's sensors that are open (past the delay) and not silent for longer than the timeout.
+        function openSensors(now){
+            return Object.keys(node.window.sensors).filter(function(k){
+                let w=node.window.sensors[k];
+                if (!w.open) return false;
+                if (k!=='input' && node.windowTimeout>0 && now-w.lastMsgTs>node.windowTimeout*60000){
+                    if (!w.stale) nlog(`Window sensor ${sensorName(k)} silent for more than ${node.windowTimeout} min: taken as closed`,"warn");
+                    w.stale=true;
+                    return false;
+                }
+                w.stale=false;
+                return true;
+            });
         }
+        function ownWindowOpen(now){ return openSensors(now).length>0; }
         function peerWindowOpen(now){
             return Object.keys(node.window.peers).filter(function(k){
                 let w=node.window.peers[k]; return w.open && now-w.ts<PEER_TTL;
@@ -265,8 +276,8 @@ module.exports = function(RED) {
                 scheduledSp: node.scheduledSp,
                 refTemp: node.refTemp,
                 away: node.away,
-                windowOpen: node.window.own,
-                windowSince: node.window.ownSince,
+                windowOpenSensors: Object.keys(node.window.sensors).filter(function(k){ return node.window.sensors[k].open; })
+                    .map(function(k){ return {topic:k, since:node.window.sensors[k].since}; }),
                 overrideMode: node.overrideMode,
                 overrideStartTs: node.overrideStartTs,
                 overrideLen: node.overrideLen,
@@ -301,11 +312,15 @@ module.exports = function(RED) {
             node.scheduledSp = savedState.scheduledSp!==undefined ? clampSp(savedState.scheduledSp) : undefined;
             node.refTemp = savedState.refTemp;
             node.away = savedState.away===true;
-            if (savedState.windowOpen===true && node.windowStateTopic){
-                // still open when Node-RED stopped: keep it until the sensor says otherwise (or goes silent)
-                node.window.own=true; node.window.rawOpen=true; node.window.ownSince=savedState.windowSince||Date.now();
-                node.window.lastMsgTs=Date.now();
-            }
+            // windows still open when Node-RED stopped: kept until their sensor says otherwise (or goes silent)
+            let saved = Array.isArray(savedState.windowOpenSensors) ? savedState.windowOpenSensors
+                      : (savedState.windowOpen===true && node.windowTopics.length ? [{topic:node.windowTopics[0], since:savedState.windowSince}] : []);
+            saved.forEach(function(w){
+                if (!w || (w.topic!=='input' && !node.window.sensors[w.topic])) return;     // sensor removed from the list since
+                let s=node.window.sensors[w.topic] || (node.window.sensors[w.topic]={timer:null});
+                Object.assign(s,{raw:true, open:true, since:w.since||Date.now(), lastMsgTs:Date.now(), stale:false});
+            });
+            if (saved.length){ node.window.own=true; node.window.ownSince=Math.min.apply(null,saved.map(function(w){return w.since||Date.now();})); }
             // An override in progress survives a restart and still ends at its time (0.83 forgot it and
             // kept the manual setpoint until the next schedule change).
             if (savedState.overrideMode===true && savedState.overrideStartTs){
@@ -356,7 +371,9 @@ module.exports = function(RED) {
             else if (node.health.state==='DEGRADED') head = 'Warning, heating continues normally.';
             else if (node.executionMode==false) head = 'Off: this room does not ask for heat.';
             else if (node.window.eff && !node.away){
-                let who = ownWindowOpen(moment().valueOf()) ? '' : ` (${peerWindowOpen(moment().valueOf()).map(function(k){return node.window.peers[k].name||k;}).join(', ')})`;
+                let nw=moment().valueOf();
+                let who = ` (${openSensors(nw).map(sensorName).concat(peerWindowOpen(nw).map(function(k){
+                    let w=node.window.peers[k]; return (w.sensors&&w.sensors.length?w.sensors.join(', '):'')+' via '+(w.name||k); })).join(', ')})`;
                 head = `Window open since ${hhmm(node.window.effSince)}${who}: heating paused, frost protection at ${t(node.awaySp)}, room ${t(node.refTemp)}.`+(node.requestSp!==undefined?` The schedule (${t(node.requestSp)}) resumes when it is closed.`:'');
             }
             else if (node.away) head = `Away: frost protection at ${t(node.awaySp)}, room ${t(node.refTemp)}`+(node.refTemp!==undefined&&parseFloat(node.awaySp)>parseFloat(node.refTemp)?', asking for heat to protect against frost.':', no heat requested.')+(node.requestSp!==undefined?` The schedule (${t(node.requestSp)}) resumes when back home.`:'');
@@ -497,7 +514,7 @@ module.exports = function(RED) {
                 return;
             }
             let subArray=[];
-            [node.temperatureSensorStateTopic,node.valveSetpointStateTopic,node.valveModeStateTopic,ha.enabled?awaySetTopic:undefined,groupTopic,node.windowStateTopic,groupWindowTopic].forEach(function(t){
+            [node.temperatureSensorStateTopic,node.valveSetpointStateTopic,node.valveModeStateTopic,ha.enabled?awaySetTopic:undefined,groupTopic,groupWindowTopic].concat(node.windowTopics).forEach(function(t){
                 if (t && String(t).trim()!="" && !subArray.includes(t)) subArray.push(t);
             });
             try{
@@ -531,22 +548,22 @@ module.exports = function(RED) {
             let flgProcess=false;
             let now=moment().valueOf();
 
-            if (node.windowStateTopic && topic==node.windowStateTopic){
-                let v=p[node.windowKey];
+            if (node.window.sensors[topic] && topic!=='input'){
+                let w=node.window.sensors[topic], v=p[node.windowKey];
                 if (v!==undefined && v!==null){
-                    node.window.lastMsgTs=now;
+                    w.lastMsgTs=now;
                     let open = String(v).trim().toLowerCase()===node.windowOpenValue.toLowerCase();
-                    if (open && !node.window.rawOpen){
-                        node.window.rawOpen=true;
-                        nlog(`Window opened, heating stops if it is still open in ${node.windowOpenDelay}s`,"info");
-                        clearTimeout(node.window.timer);
-                        node.window.timer=setTimeout(function(){ node.window.timer=null; setWindowOwn(true); }, node.windowOpenDelay*1000);
-                    } else if (!open && node.window.rawOpen){
-                        node.window.rawOpen=false;
-                        clearTimeout(node.window.timer); node.window.timer=null;
-                        if (node.window.own) setWindowOwn(false);
-                        else nlog("Window closed before the delay, nothing changed","info");
-                    } else if (node.window.own && node.window.stale){
+                    if (open && !w.raw){
+                        w.raw=true;
+                        nlog(`Window ${sensorName(topic)} opened, heating stops if it is still open in ${node.windowOpenDelay}s`,"info");
+                        clearTimeout(w.timer);
+                        w.timer=setTimeout(function(){ w.timer=null; w.open=true; w.since=moment().valueOf(); windowSensorsChanged(sensorName(topic)+' open'); }, node.windowOpenDelay*1000);
+                    } else if (!open && w.raw){
+                        w.raw=false;
+                        clearTimeout(w.timer); w.timer=null;
+                        if (w.open){ w.open=false; windowSensorsChanged(sensorName(topic)+' closed'); }
+                        else nlog(`Window ${sensorName(topic)} closed before the delay, nothing changed`,"info");
+                    } else if (w.open && w.stale){
                         flgProcess=true;                       // sensor back after a silence: re-evaluate
                     }
                 }
@@ -728,7 +745,7 @@ module.exports = function(RED) {
                     value_template:"{{ 'ON' if value_json.away else 'OFF' }}",command_topic:awaySetTopic,
                     payload_on:'ON',payload_off:'OFF',state_on:'ON',state_off:'OFF',retain:true})],
             ];
-            if (node.windowStateTopic || groupWindowTopic) entities.push(
+            if (node.windowTopics.length || groupWindowTopic) entities.push(
                 ['binary_sensor','window',Object.assign({},common,{name:'Window',unique_id:uid+'_window',device_class:'window',
                     value_template:"{{ 'ON' if value_json.window else 'OFF' }}"})]);
             entities.push(
@@ -773,6 +790,7 @@ module.exports = function(RED) {
                 window:node.window.eff,
                 window_since:node.window.eff?new Date(node.window.effSince).toISOString():null,
                 window_source:node.window.eff?(ownWindowOpen(now)?'sensor':'room'):null,
+                window_sensors:openSensors(now).map(sensorName).concat(peerWindowOpen(now).reduce(function(a,k){ return a.concat(node.window.peers[k].sensors||[]); },[])),
                 group:node.groupId
             };
             const s=JSON.stringify(st);
@@ -802,30 +820,37 @@ module.exports = function(RED) {
         }
 
         // Window of this valve's sensor open (after the delay) or closed.
-        function setWindowOwn(open, why){
-            if (open===node.window.own) return;
-            node.window.own=open;
-            node.window.ownSince=moment().valueOf();
+        // A sensor of this valve changed (past the delay): the room is paused while any of them is open.
+        function syncOwnWindow(now, why){
+            let open=ownWindowOpen(now);
+            if (open===node.window.own) return false;
+            node.window.own=open; node.window.ownSince=now;
             nlog(`Window ${open?'open: heating paused':'closed: heating resumes'}${why?' ('+why+')':''}`,"info");
+            publishWindow(true);
+            return true;
+        }
+        function windowSensorsChanged(why){
+            let now=moment().valueOf();
+            if (!syncOwnWindow(now, why)) nlog(`Window ${why}: open now ${openSensors(now).map(sensorName).join(', ')||'none'}`,"info");
             publishWindow(true);
             saveState();
             evaluate();
         }
         function publishWindow(force){
-            if (!groupWindowTopic || !node.windowStateTopic) return;
+            if (!groupWindowTopic || !Object.keys(node.window.sensors).length) return;
             let now=moment().valueOf();
             let open=ownWindowOpen(now);
             if (!force && !(open && now-node.window.lastPubTs>=5*60000)) return;
             node.window.lastPubTs=now;
             node.mqttstack.push({topic:groupWindowTopic,qos:1,retain:false,payload:{
-                open:open, since:node.window.ownSince, groupId:node.groupId, from:node.id, requestedBy:node.name}});
+                open:open, since:node.window.ownSince, sensors:openSensors(now).map(sensorName), groupId:node.groupId, from:node.id, requestedBy:node.name}});
         }
         // Window state of another valve of the room.
         function peerWindow(p){
             if (!p || typeof p!=='object' || p.from===undefined || p.from===node.id) return;
             if (String(p.groupId)!==String(node.groupId)) return;
             let now=moment().valueOf();
-            node.window.peers[p.from]={open:p.open===true, ts:now, name:p.requestedBy};
+            node.window.peers[p.from]={open:p.open===true, ts:now, name:p.requestedBy, sensors:Array.isArray(p.sensors)?p.sensors.map(String):[]};
             if (windowOpen(now)!==node.window.eff) evaluate();
         }
 
@@ -995,10 +1020,11 @@ module.exports = function(RED) {
                 // window state from a flow (no sensor topic needed): {command:"window", value:true|false}
                 let v=awayValue(msg.payload.value===undefined ? true : msg.payload.value);
                 if (v===undefined){ nlog(`Command:window invalid value ${JSON.stringify(msg.payload.value)}`,"error"); return; }
-                node.window.lastMsgTs=moment().valueOf(); node.window.rawOpen=v;
-                clearTimeout(node.window.timer); node.window.timer=null;
-                if (v===node.window.own){ evaluate(); return; }
-                setWindowOwn(v,'input');
+                let w=node.window.sensors['input'] || (node.window.sensors['input']={timer:null});
+                let was=w.open===true;
+                Object.assign(w,{raw:v, open:v, since:v?(was?w.since:moment().valueOf()):0, lastMsgTs:moment().valueOf(), stale:false});
+                if (was===v){ evaluate(); return; }
+                windowSensorsChanged('input '+(v?'open':'closed'));
                 return;
             }
 
@@ -1111,7 +1137,8 @@ module.exports = function(RED) {
             checkOverrideExpiry();
             let healthChanged=computeHealth(now);
 
-            // Window: effective state (own sensor or room), a change pushes the TRV and tells the boiler now.
+            // Window: effective state (own sensors or room), a change pushes the TRV and tells the boiler now.
+            if (syncOwnWindow(now, 'sensor silent')) saveState();
             let wopen=windowOpen(now);
             if (wopen!==node.window.eff){
                 node.window.eff=wopen; node.window.effSince=now;
@@ -1289,7 +1316,7 @@ module.exports = function(RED) {
 
         node.on('close', function(done) {
             clearTimeout(node.manualTimer);
-            clearTimeout(node.window.timer);
+            Object.keys(node.window.sensors).forEach(function(k){ clearTimeout(node.window.sensors[k].timer); });
             clearInterval(node.evalInterval);
             clearTimeout(node.startTimeout);
             if (node.mqttclient) {

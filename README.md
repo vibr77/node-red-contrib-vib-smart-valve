@@ -195,7 +195,9 @@ a group id would follow each other. Home Assistant attributes: `override_until`,
 ## Window sensor (0.85)
 
 Optional: set **Window sensor [state]** to the Zigbee2MQTT topic of a door/window contact sensor (key `contact`, open when `false`,
-both editable).
+both editable). A room with several windows lists them all, separated by commas (0.86), e.g.
+`zigbee2mqtt/DS_CHLOE_VELUX_W, zigbee2mqtt/DS_CHLOE_VELUX_E`: the room is paused while **any** of them has been open longer than
+the delay and resumes when **all** are closed. Each sensor has its own delay and its own silence timeout.
 
 - Window open for more than **Open delay** (default 60 s, so walking through a door does nothing): the TRV gets the Away setpoint
   (frost protection, 7 °C) and the boiler receives it with `window: true`.
@@ -205,7 +207,8 @@ both editable).
   5 min while open, forgotten 15 min after the sending valve went silent): one sensor per room is enough.
 - A sensor silent for more than the timeout (default 180 min) is taken as closed, so a flat battery never stops a room from heating.
 - Not a fault: health stays OK. Survives a Node-RED restart. From a flow: `{command:"window", value:true|false}`.
-- Home Assistant: **Window** binary sensor (device class window); attributes `window`, `window_since`, `window_source` (`sensor` / `room`).
+- Home Assistant: **Window** binary sensor (device class window); attributes `window`, `window_since`, `window_source` (`sensor` / `room`),
+  `window_sensors` (names of the open ones); the status detail names them too.
 
 The Aqara TRV's own *window detection* (temperature drop) can stay on or be switched off; with a real sensor it is no longer needed.
 
