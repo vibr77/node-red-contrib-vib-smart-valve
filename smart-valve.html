@@ -59,6 +59,11 @@
             }},
             
             cycleDuration: {value:"5"},
+            windowStateTopic: {value:""},
+            windowKey: {value:"contact"},
+            windowOpenValue: {value:"false"},
+            windowOpenDelay: {value:"60",validate:function(v){ return v==="" || v===undefined || (!isNaN(v) && Number(v)>=0 && Number(v)<=3600); }},
+            windowTimeout: {value:"180",validate:function(v){ return v==="" || v===undefined || (!isNaN(v) && Number(v)>=0); }},
             awaySp: {value:"7",validate:function(v){ return v==="" || v===undefined || (!isNaN(v) && Number(v)>=0 && Number(v)<=16); }},
             offSp: {value:"5",required:true,validate:function(v){
                 if (isNaN(v)){
@@ -131,7 +136,7 @@
             const node = this;
             // 0.82: nodes created with an older version have no value for the new options. Show the
             // default that the runtime applies instead of an empty field.
-            ['awaySp','manualSettle','manualMaxWait','maxSp','heartbeat','sensorTimeout','trvTimeout','alarmDuration','frozenDelta','frozenDuration','ackTimeout','failedAction','trvLocalTempKey','trvAlarmKey'].join(',').split(',').forEach(function(k){
+            ['awaySp','manualSettle','manualMaxWait','windowKey','windowOpenValue','windowOpenDelay','windowTimeout','maxSp','heartbeat','sensorTimeout','trvTimeout','alarmDuration','frozenDelta','frozenDuration','ackTimeout','failedAction','trvLocalTempKey','trvAlarmKey'].join(',').split(',').forEach(function(k){
                 var d = node._def.defaults[k];
                 if (d && (node[k]===undefined || node[k]==="" || node[k]===null)) { $('#node-input-'+k).val(d.value); }
             });
@@ -257,6 +262,27 @@
         <label for="node-input-awaySp"><i class="fa fa-suitcase">&nbsp;</i> Away setpoint</label>
         <input type="text" id="node-input-awaySp" placeholder="7" title="Frost protection setpoint applied to the TRV and sent to the boiler while away" style="width:60px !important; text-align: right;"></input>
         <label for="node-input-awaySp">°C</label>
+    </div>
+
+    <div class="form-row">
+        <span><i class="fa fa-window-maximize">&nbsp;</i><b>Window sensor</b> (optional: no heating while a window of the room is open)</span>
+    </div>
+    <div class="form-row">
+        <label for="node-input-windowStateTopic"><i class="fa fa-window-maximize">&nbsp;</i>[state]</label>
+        <input type="text" id="node-input-windowStateTopic" placeholder="zigbee2mqtt/WINDOW_SALON (empty = no sensor)">
+    </div>
+    <div class="form-row">
+        <label for="node-input-windowKey"><i class="fa fa-key">&nbsp;</i>[key]</label>
+        <input type="text" id="node-input-windowKey" placeholder="contact" style="width:120px !important">
+        <span>open when =</span>
+        <input type="text" id="node-input-windowOpenValue" placeholder="false" style="width:70px !important" title="Value meaning open (Zigbee2MQTT contact sensors: contact=false)">
+    </div>
+    <div class="form-row">
+        <label for="node-input-windowOpenDelay"><i class="fa fa-hourglass-half">&nbsp;</i>Open delay</label>
+        <input type="text" id="node-input-windowOpenDelay" style="width:60px !important; text-align: right;" title="The window must stay open this long before heating stops">
+        <span>s, sensor silent after</span>
+        <input type="text" id="node-input-windowTimeout" style="width:60px !important; text-align: right;" title="Without news from the sensor for this long, the window is taken as closed (0 = never)">
+        <span>min = closed</span>
     </div>
 
      <div class="form-row">
@@ -490,8 +516,8 @@
 
     <h3>INPUT MESSAGE FORMAT:</h3>
     <pre><code></code>  msg.payload = {
-            command:        [number], [1|set|on|0|off|trigger|override|away|home]  // Input message command
-            value:          [boolean|"on"|"off"]                             // away only: true (default) = away, false = back home
+            command:        [number], [1|set|on|0|off|trigger|override|away|home|window]  // Input message command
+            value:          [boolean|"on"|"off"]                             // away / window: true (default) = away / open, false = home / closed
             setpoint:       [number],                                        // Requested temperature set point
             temperature:    [number],                                        // Current valve temperature
             requestedBy:    [string],                                        // Command requester (in case of override valve name) 
@@ -662,6 +688,16 @@
        other valve with the same Group id (and Manual valve on, not off or away) applies the same setpoint with the same end time,
        so the whole room returns to the schedule together. No flow wiring is needed; the <code>override</code> message is still sent
        on the output for older flows, duplicates are ignored. An override survives a restart. Group id must then be unique per room.</p>
+    <h3>Window sensor (0.85)</h3>
+    <p>With a <b>Window sensor</b> topic (e.g. an Aqara contact sensor in Zigbee2MQTT: key <code>contact</code>, open when <code>false</code>),
+       a window open for more than <b>Open delay</b> (default 60 s) stops the heating of the room: the TRV gets the Away setpoint (frost protection)
+       and the boiler receives it with <code>window:true</code>. When it closes, the current schedule is applied at once; a manual override in
+       progress resumes with its original end time; a knob turned while open is put back.</p>
+    <p>With <b>Share with room</b>, the other valves of the same Group id follow (<code>smartheating/group/&lt;Group id&gt;/window</code>, refreshed
+       every 5 min while open, forgotten 15 min after the valve went silent), so one sensor is enough for a room. A sensor silent for more than
+       the timeout (default 180 min) is taken as closed. An open window is not a fault (health stays OK) and survives a restart.
+       Also settable from a flow: <code>{command:"window", value:true|false}</code>. Home Assistant: <b>Window</b> binary sensor, attributes
+       <code>window</code>, <code>window_since</code>, <code>window_source</code>.</p>
     <h3>Away (0.83)</h3>
     <p><code>{command:"away"}</code> (or <code>{command:"away", value:false}</code> / <code>{command:"home"}</code>), or the
        <b>Away</b> switch in Home Assistant (topic <code>smartheating/valve/&lt;name&gt;/away/set</code>, payload <code>ON</code>/<code>OFF</code>).</p>

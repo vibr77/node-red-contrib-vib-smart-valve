@@ -789,4 +789,145 @@ describe('smart-valve 0.82', function () {
             assert.strictEqual(st.knob_settling, null);
         });
     });
+
+    describe('Window sensor (0.85)', function () {
+        const WIN = (name) => ({ windowStateTopic: `zigbee2mqtt/WIN_${name}` });
+        const win = (name, open) => H.broker.publish(`zigbee2mqtt/WIN_${name}`, JSON.stringify({ contact: !open, battery: 100 }));
+        const grpWin = (g) => H.broker.on(`smartheating/group/${g}/window`);
+
+        it('W-01 window open for more than 60 s: frost setpoint on the TRV and to the boiler; closed: schedule back at once', function () {
+            const { v, trv } = settledRoom('LOU', { cfg: WIN('LOU') });
+            win('LOU', true);
+            sec(50);
+            assert.strictEqual(trv.state.occupied_heating_setpoint, 20, 'nothing before the delay');
+            sec(15);
+            assert.strictEqual(trv.state.occupied_heating_setpoint, 7);
+            let p = lastBoiler(v);
+            assert.strictEqual(p.setpoint, '7.00');
+            assert.strictEqual(p.window, true);
+            assert.match(v._status.text, /^Window open/);
+            win('LOU', false);
+            sec(5);
+            assert.strictEqual(trv.state.occupied_heating_setpoint, 20);
+            p = lastBoiler(v);
+            assert.strictEqual(p.setpoint, '20.00');
+            assert.strictEqual(p.window, false);
+        });
+
+        it('W-02 a door opened for less than the delay changes nothing', function () {
+            const { v, trv } = settledRoom('LOU', { cfg: WIN('LOU') });
+            const n = boilerMsgs(v).length;
+            win('LOU', true); sec(30); win('LOU', false); sec(60);
+            assert.strictEqual(trv.state.occupied_heating_setpoint, 20);
+            assert.ok(!boilerMsgs(v).slice(n).some(m => m.msg.payload.setpoint === '7.00'));
+        });
+
+        it('W-03 schedule changes while open are applied on close; a manual override keeps its end time', function () {
+            const { v, trv } = settledRoom('LOU', { cfg: Object.assign({ allowOverride: true }, WIN('LOU')) });
+            trv.knob(22); sec(25);
+            assert.strictEqual(v.overrideMode, true);
+            const end = v.overrideStartTs + 60 * 60000;
+            win('LOU', true); sec(65);
+            assert.strictEqual(trv.state.occupied_heating_setpoint, 7);
+            schedule(v, 19); sec(5);
+            assert.strictEqual(trv.state.occupied_heating_setpoint, 7, 'still paused');
+            win('LOU', false); sec(5);
+            assert.strictEqual(trv.state.occupied_heating_setpoint, 22, 'override resumes');
+            assert.strictEqual(v.overrideStartTs + 60 * 60000, end, 'same end time');
+            clock.tick(end - Date.now() + 2 * 60000);
+            assert.strictEqual(trv.state.occupied_heating_setpoint, 19, 'then the latest schedule');
+        });
+
+        it('W-04 a knob turn while the window is open is put back, a knob settling is cancelled', function () {
+            const { v, trv } = settledRoom('LOU', { cfg: Object.assign({ allowOverride: true, windowOpenDelay: '10' }, WIN('LOU')) });
+            trv.knob(23); sec(5);                              // settling (taken at 25 s)...
+            win('LOU', true); sec(12);                         // ...but the window pauses the room at 15 s
+            assert.strictEqual(trv.state.occupied_heating_setpoint, 7);
+            sec(50);
+            assert.strictEqual(v.manual, null);
+            assert.strictEqual(v.overrideMode, false);
+            trv.knob(24); min(2);
+            assert.strictEqual(trv.state.occupied_heating_setpoint, 7);
+        });
+
+        it('W-05 one sensor pauses the whole room (same group), closing resumes everyone', function () {
+            const a = settledRoom('BIBLIO', { cfg: Object.assign({ groupId: '3' }, WIN('BIBLIO')) });
+            const b = settledRoom('ESCALIER', { cfg: { groupId: '3' } });
+            const c = settledRoom('CANAPE', { cfg: { groupId: '3' } });
+            const lou = settledRoom('LOU', { cfg: { groupId: '51' } });
+            win('BIBLIO', true); sec(65);
+            [a, b, c].forEach(r => assert.strictEqual(r.trv.state.occupied_heating_setpoint, 7, r.v.name));
+            assert.strictEqual(lastBoiler(b.v).window, true);
+            assert.strictEqual(lou.trv.state.occupied_heating_setpoint, 20, 'other room untouched');
+            min(20);                                          // refreshed every 5 min: still paused
+            assert.strictEqual(b.trv.state.occupied_heating_setpoint, 7);
+            win('BIBLIO', false); sec(5);
+            [a, b, c].forEach(r => assert.strictEqual(r.trv.state.occupied_heating_setpoint, 20, r.v.name));
+        });
+
+        it('W-06 a room window state is forgotten 15 min after its valve went silent', async function () {
+            const a = settledRoom('BIBLIO', { cfg: Object.assign({ groupId: '3' }, WIN('BIBLIO')) });
+            const b = settledRoom('ESCALIER', { cfg: { groupId: '3' } });
+            win('BIBLIO', true); sec(65);
+            assert.strictEqual(b.trv.state.occupied_heating_setpoint, 7);
+            a.th.stop(); a.trv.stop(); await RED.close(a.v); rooms = rooms.filter(r => r !== a);
+            min(22);
+            assert.strictEqual(b.trv.state.occupied_heating_setpoint, 20, 'heating resumes');
+        });
+
+        it('W-07 a window sensor silent for more than 3 h is taken as closed', function () {
+            const { trv } = settledRoom('LOU', { cfg: WIN('LOU') });
+            win('LOU', true); sec(65);
+            assert.strictEqual(trv.state.occupied_heating_setpoint, 7);
+            min(185);
+            assert.strictEqual(trv.state.occupied_heating_setpoint, 20);
+        });
+
+        it('W-08 an open window survives a Node-RED restart', async function () {
+            const r = settledRoom('LOU', { cfg: WIN('LOU') });
+            win('LOU', true); sec(65);
+            r.th.stop(); await RED.close(r.v); rooms = [];
+            const v = RED.create('smart-valve', H.valveConfig('v_LOU', 'LOU', WIN('LOU')));
+            const th = new H.Sensor('zigbee2mqtt/TH_LOU', 19, 20).start();
+            rooms.push({ v, th, trv: r.trv });
+            sec(5);
+            assert.strictEqual(v.window.eff, true);
+            assert.strictEqual(lastBoiler(v).setpoint, '7.00');
+            win('LOU', false); sec(5);
+            assert.strictEqual(r.trv.state.occupied_heating_setpoint, 20);
+        });
+
+        it('W-09 configurable key and open value; window state from a flow', function () {
+            const { v, trv } = settledRoom('LOU', { cfg: { windowStateTopic: 'zigbee2mqtt/WIN_LOU', windowKey: 'window', windowOpenValue: 'open', windowOpenDelay: '10' } });
+            H.broker.publish('zigbee2mqtt/WIN_LOU', JSON.stringify({ window: 'OPEN' })); sec(15);
+            assert.strictEqual(trv.state.occupied_heating_setpoint, 7);
+            H.broker.publish('zigbee2mqtt/WIN_LOU', JSON.stringify({ window: 'closed' })); sec(5);
+            assert.strictEqual(trv.state.occupied_heating_setpoint, 20);
+            RED.input(v, { payload: { command: 'window', value: true } }); sec(5);
+            assert.strictEqual(trv.state.occupied_heating_setpoint, 7);
+            RED.input(v, { payload: { command: 'window', value: false } }); sec(5);
+            assert.strictEqual(trv.state.occupied_heating_setpoint, 20);
+        });
+
+        it('W-10 no window topic: nothing subscribed or published, no change of behaviour', function () {
+            settledRoom('LOU');
+            assert.ok(!H.broker.subs.some(s => /WIN_|\/window$/.test(s.topic) && false));
+            win('LOU', true); sec(65);
+            assert.strictEqual(rooms[0].trv.state.occupied_heating_setpoint, 20);
+            assert.strictEqual(grpWin(1).length, 0);
+        });
+
+        it('W-11 Home Assistant: Window binary sensor and status detail', function () {
+            load({ haDiscovery: true });
+            settledRoom('LOU', { cfg: WIN('LOU') });
+            const cfg = JSON.parse(H.broker.retained['homeassistant/binary_sensor/smartvalve_vLOU/window/config']);
+            assert.strictEqual(cfg.device_class, 'window');
+            win('LOU', true); sec(65);
+            const st = JSON.parse(H.broker.retained['smartheating/valve/lou/state']);
+            assert.strictEqual(st.window, true);
+            assert.strictEqual(st.window_source, 'sensor');
+            assert.match(st.status, /^Window open since \d\d:\d\d: heating paused, frost protection at 7\.0 °C/);
+            assert.strictEqual(st.health, 'OK', 'an open window is not a fault');
+        });
+    });
 });

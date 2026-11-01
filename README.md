@@ -162,6 +162,7 @@ setpoint. Check that the valve pin moves freely, then recalibrate the TRV."*
 | `trigger` / `1` | Re-evaluate now. |
 | `away` (optional `value`: `true`/`false`, `"on"`/`"off"`) | Away on (default) or off. See *Away mode*. |
 | `home` | Away off: the latest scheduled setpoint is applied again. |
+| `window` (optional `value`: `true`/`false`) | Window open (default) / closed, as if reported by the window sensor (no delay). |
 
 Messages with `target: "boiler"` (sent by other valves) are ignored.
 
@@ -169,7 +170,7 @@ Messages with `target: "boiler"` (sent by other valves) are ignored.
 
 ```json
 { "command": "set", "target": "boiler", "setpoint": "20.00", "temperature": "19.50",
-  "requestedBy": "SV_CHLOE", "groupId": "52", "health": "OK", "reasons": [], "away": false }
+  "requestedBy": "SV_CHLOE", "groupId": "52", "health": "OK", "reasons": [], "away": false, "window": false }
 ```
 
 Sent when the temperature or setpoint changes, when the health changes, and at least every *Heartbeat*.
@@ -190,6 +191,23 @@ With *Manual valve* on:
 No flow wiring is needed. The `override` message is still sent on the output (older flows wiring valves together keep working;
 a change received twice is applied once). **Group id must be unique per room** with this option: valves of different rooms sharing
 a group id would follow each other. Home Assistant attributes: `override_until`, `knob_settling`.
+
+## Window sensor (0.85)
+
+Optional: set **Window sensor [state]** to the Zigbee2MQTT topic of a door/window contact sensor (key `contact`, open when `false`,
+both editable).
+
+- Window open for more than **Open delay** (default 60 s, so walking through a door does nothing): the TRV gets the Away setpoint
+  (frost protection, 7 °C) and the boiler receives it with `window: true`.
+- Window closed: the current schedule is applied at once; a manual override in progress resumes with its original end time; a knob
+  turned while open is put back; a knob still settling when the window opens is dropped.
+- With *Share with room*, every valve with the same Group id follows (topic `smartheating/group/<Group id>/window`, refreshed every
+  5 min while open, forgotten 15 min after the sending valve went silent): one sensor per room is enough.
+- A sensor silent for more than the timeout (default 180 min) is taken as closed, so a flat battery never stops a room from heating.
+- Not a fault: health stays OK. Survives a Node-RED restart. From a flow: `{command:"window", value:true|false}`.
+- Home Assistant: **Window** binary sensor (device class window); attributes `window`, `window_since`, `window_source` (`sensor` / `room`).
+
+The Aqara TRV's own *window detection* (temperature drop) can stay on or be switched off; with a real sensor it is no longer needed.
 
 ## Away mode (0.83)
 

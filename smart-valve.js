@@ -127,6 +127,15 @@ module.exports = function(RED) {
         this.manual=null;                           // knob turn waiting to settle {sp, raw, firstTs, lastTs}
         this.manualTimer=null;
 
+        // 0.85: window/door contact sensor. While a window of the room is open the room is not heated
+        // (frost protection at the away setpoint); the schedule comes back as soon as it closes.
+        this.windowStateTopic = (n.windowStateTopic && String(n.windowStateTopic).trim()!=='') ? String(n.windowStateTopic).trim() : undefined;
+        this.windowKey = (n.windowKey && String(n.windowKey).trim()!=='') ? String(n.windowKey).trim() : 'contact';
+        this.windowOpenValue = (n.windowOpenValue!==undefined && String(n.windowOpenValue).trim()!=='') ? String(n.windowOpenValue).trim() : 'false';
+        this.windowOpenDelay = opt(n.windowOpenDelay,60,true);      // s the window must stay open before heating stops
+        this.windowTimeout = opt(n.windowTimeout,180,true);         // min without news from the sensor -> taken as closed (0 = never)
+        this.window = {own:false, ownSince:0, rawOpen:false, lastMsgTs:0, timer:null, peers:{}, eff:false, effSince:0, lastPubTs:0, stale:false};
+
         // --- 0.82 options (all minutes unless stated, 0 disables a check) -----------------------------
         this.maxSp=opt(n.maxSp,24);                         // °C ceiling for any setpoint applied or forwarded
         this.heartbeat=opt(n.heartbeat,10,true);            // re-send to the boiler at least this often
@@ -221,6 +230,27 @@ module.exports = function(RED) {
             return node.overrideStartTs + node.overrideLen*60000;
         }
 
+        // Window: open according to this valve's sensor (fresh enough) or to another valve of the room.
+        const PEER_TTL = 15*60000;
+        function ownWindowOpen(now){
+            if (!node.window.own) return false;
+            if (node.windowTimeout>0 && now-node.window.lastMsgTs>node.windowTimeout*60000){
+                if (!node.window.stale) nlog(`Window sensor silent for more than ${node.windowTimeout} min: taken as closed`,"warn");
+                node.window.stale=true;
+                return false;
+            }
+            node.window.stale=false;
+            return true;
+        }
+        function peerWindowOpen(now){
+            return Object.keys(node.window.peers).filter(function(k){
+                let w=node.window.peers[k]; return w.open && now-w.ts<PEER_TTL;
+            });
+        }
+        function windowOpen(now){ return ownWindowOpen(now) || peerWindowOpen(now).length>0; }
+        // Heating paused: away or a window open. Both mean frost protection only.
+        function paused(){ return node.away || node.window.eff; }
+
         // ---------------------------------------------------------------------------------------
         // State persistence
         // ---------------------------------------------------------------------------------------
@@ -235,6 +265,8 @@ module.exports = function(RED) {
                 scheduledSp: node.scheduledSp,
                 refTemp: node.refTemp,
                 away: node.away,
+                windowOpen: node.window.own,
+                windowSince: node.window.ownSince,
                 overrideMode: node.overrideMode,
                 overrideStartTs: node.overrideStartTs,
                 overrideLen: node.overrideLen,
@@ -269,6 +301,11 @@ module.exports = function(RED) {
             node.scheduledSp = savedState.scheduledSp!==undefined ? clampSp(savedState.scheduledSp) : undefined;
             node.refTemp = savedState.refTemp;
             node.away = savedState.away===true;
+            if (savedState.windowOpen===true && node.windowStateTopic){
+                // still open when Node-RED stopped: keep it until the sensor says otherwise (or goes silent)
+                node.window.own=true; node.window.rawOpen=true; node.window.ownSince=savedState.windowSince||Date.now();
+                node.window.lastMsgTs=Date.now();
+            }
             // An override in progress survives a restart and still ends at its time (0.83 forgot it and
             // kept the manual setpoint until the next schedule change).
             if (savedState.overrideMode===true && savedState.overrideStartTs){
@@ -318,6 +355,10 @@ module.exports = function(RED) {
             if (node.health.state==='FAILED') head = node.failedAction==='failedAction.keep' ? 'FAILED, demand kept (When FAILED = keep).' : 'FAILED: this room no longer asks the boiler for heat.';
             else if (node.health.state==='DEGRADED') head = 'Warning, heating continues normally.';
             else if (node.executionMode==false) head = 'Off: this room does not ask for heat.';
+            else if (node.window.eff && !node.away){
+                let who = ownWindowOpen(moment().valueOf()) ? '' : ` (${peerWindowOpen(moment().valueOf()).map(function(k){return node.window.peers[k].name||k;}).join(', ')})`;
+                head = `Window open since ${hhmm(node.window.effSince)}${who}: heating paused, frost protection at ${t(node.awaySp)}, room ${t(node.refTemp)}.`+(node.requestSp!==undefined?` The schedule (${t(node.requestSp)}) resumes when it is closed.`:'');
+            }
             else if (node.away) head = `Away: frost protection at ${t(node.awaySp)}, room ${t(node.refTemp)}`+(node.refTemp!==undefined&&parseFloat(node.awaySp)>parseFloat(node.refTemp)?', asking for heat to protect against frost.':', no heat requested.')+(node.requestSp!==undefined?` The schedule (${t(node.requestSp)}) resumes when back home.`:'');
             else if (node.health.state==='UNKNOWN') head = 'Starting.';
             else {
@@ -456,7 +497,7 @@ module.exports = function(RED) {
                 return;
             }
             let subArray=[];
-            [node.temperatureSensorStateTopic,node.valveSetpointStateTopic,node.valveModeStateTopic,ha.enabled?awaySetTopic:undefined,groupTopic].forEach(function(t){
+            [node.temperatureSensorStateTopic,node.valveSetpointStateTopic,node.valveModeStateTopic,ha.enabled?awaySetTopic:undefined,groupTopic,node.windowStateTopic,groupWindowTopic].forEach(function(t){
                 if (t && String(t).trim()!="" && !subArray.includes(t)) subArray.push(t);
             });
             try{
@@ -489,6 +530,27 @@ module.exports = function(RED) {
         function callbackMqtt(topic,p){
             let flgProcess=false;
             let now=moment().valueOf();
+
+            if (node.windowStateTopic && topic==node.windowStateTopic){
+                let v=p[node.windowKey];
+                if (v!==undefined && v!==null){
+                    node.window.lastMsgTs=now;
+                    let open = String(v).trim().toLowerCase()===node.windowOpenValue.toLowerCase();
+                    if (open && !node.window.rawOpen){
+                        node.window.rawOpen=true;
+                        nlog(`Window opened, heating stops if it is still open in ${node.windowOpenDelay}s`,"info");
+                        clearTimeout(node.window.timer);
+                        node.window.timer=setTimeout(function(){ node.window.timer=null; setWindowOwn(true); }, node.windowOpenDelay*1000);
+                    } else if (!open && node.window.rawOpen){
+                        node.window.rawOpen=false;
+                        clearTimeout(node.window.timer); node.window.timer=null;
+                        if (node.window.own) setWindowOwn(false);
+                        else nlog("Window closed before the delay, nothing changed","info");
+                    } else if (node.window.own && node.window.stale){
+                        flgProcess=true;                       // sensor back after a silence: re-evaluate
+                    }
+                }
+            }
 
             if (topic==node.temperatureSensorStateTopic){
                 let raw=p[node.temperatureSensorKey];
@@ -542,7 +604,7 @@ module.exports = function(RED) {
                         node.requestSp=clampSp(valveSp);
                         flgProcess=true;
                     }
-                    else if ((node.trv.pendingAck || node.trv.noAck) && node.allowOverride==true && node.executionMode==true && !guard && !node.away &&
+                    else if ((node.trv.pendingAck || node.trv.noAck) && node.allowOverride==true && node.executionMode==true && !guard && !paused() &&
                              node.trv.pendingAck && node.trv.pendingAck.prev!==undefined && !sameAck(valveSp,node.trv.pendingAck.prev)){
                         // A value that is neither what we sent nor what the TRV had before: someone turned the knob
                         // while we were waiting. Accept it as a manual change (Manual valve on).
@@ -562,9 +624,9 @@ module.exports = function(RED) {
                         flgProcess=true;
                     }
                     else if (node.sp!==undefined && knobMoved(valveSp,node.sp)){
-                        if (node.away && node.executionMode==true){
-                            // Away: nobody is supposed to be there, keep the frost protection setpoint.
-                            nlog(`TRV reports ${valveSp}°C while away (${node.sp}°C) -> re-applying`,"warn");
+                        if (paused() && node.executionMode==true){
+                            // Away or window open: no heating, keep the frost protection setpoint.
+                            nlog(`TRV reports ${valveSp}°C while ${node.away?'away':'the window is open'} (${node.sp}°C) -> re-applying`,"warn");
                             node.driftPending=true; node.driftForce=true;
                             flgProcess=true;
                         }
@@ -650,6 +712,8 @@ module.exports = function(RED) {
         // Valves of one room (same group id) share manual changes on this topic, without any flow wiring.
         const hasGroup = node.groupId!==undefined && node.groupId!==null && String(node.groupId).trim()!=='';
         const groupTopic = (node.groupSync && hasGroup) ? `${ha.base}/group/${slug(String(node.groupId))}/manual` : null;
+        // ... and window states (not retained, refreshed every 5 min while open, forgotten after 15 min)
+        const groupWindowTopic = (node.groupSync && hasGroup) ? `${ha.base}/group/${slug(String(node.groupId))}/window` : null;
 
         function haDiscovery(){
             if (!ha.enabled) return;
@@ -663,8 +727,12 @@ module.exports = function(RED) {
                 ['switch','away',Object.assign({},common,{name:'Away',unique_id:uid+'_away',icon:'mdi:home-export-outline',
                     value_template:"{{ 'ON' if value_json.away else 'OFF' }}",command_topic:awaySetTopic,
                     payload_on:'ON',payload_off:'OFF',state_on:'ON',state_off:'OFF',retain:true})],
-                ['sensor','status',Object.assign({name:'Status detail',unique_id:uid+'_status',icon:'mdi:information-outline',value_template:'{{ value_json.status[:255] }}'},common)],
             ];
+            if (node.windowStateTopic || groupWindowTopic) entities.push(
+                ['binary_sensor','window',Object.assign({},common,{name:'Window',unique_id:uid+'_window',device_class:'window',
+                    value_template:"{{ 'ON' if value_json.window else 'OFF' }}"})]);
+            entities.push(
+                ['sensor','status',Object.assign({name:'Status detail',unique_id:uid+'_status',icon:'mdi:information-outline',value_template:'{{ value_json.status[:255] }}'},common)]);
             [['sensor','Room sensor check','mdi:thermometer-check'],['trv_link','TRV link check','mdi:access-point-check'],
              ['valve_alarm','Valve alarm check','mdi:valve'],['tracking','TRV tracking check','mdi:chart-line-variant'],
              ['setpoint','Setpoint confirmation check','mdi:check-network-outline']].forEach(function(c){
@@ -702,6 +770,9 @@ module.exports = function(RED) {
                 mode:node.executionMode?'on':'off',
                 away:node.away,
                 away_setpoint:parseFloat(node.awaySp),
+                window:node.window.eff,
+                window_since:node.window.eff?new Date(node.window.effSince).toISOString():null,
+                window_source:node.window.eff?(ownWindowOpen(now)?'sensor':'room'):null,
                 group:node.groupId
             };
             const s=JSON.stringify(st);
@@ -728,6 +799,34 @@ module.exports = function(RED) {
                     node.inputTrigger=true;          // forces the scheduled setpoint to be pushed to the TRV
                 }
             }
+        }
+
+        // Window of this valve's sensor open (after the delay) or closed.
+        function setWindowOwn(open, why){
+            if (open===node.window.own) return;
+            node.window.own=open;
+            node.window.ownSince=moment().valueOf();
+            nlog(`Window ${open?'open: heating paused':'closed: heating resumes'}${why?' ('+why+')':''}`,"info");
+            publishWindow(true);
+            saveState();
+            evaluate();
+        }
+        function publishWindow(force){
+            if (!groupWindowTopic || !node.windowStateTopic) return;
+            let now=moment().valueOf();
+            let open=ownWindowOpen(now);
+            if (!force && !(open && now-node.window.lastPubTs>=5*60000)) return;
+            node.window.lastPubTs=now;
+            node.mqttstack.push({topic:groupWindowTopic,qos:1,retain:false,payload:{
+                open:open, since:node.window.ownSince, groupId:node.groupId, from:node.id, requestedBy:node.name}});
+        }
+        // Window state of another valve of the room.
+        function peerWindow(p){
+            if (!p || typeof p!=='object' || p.from===undefined || p.from===node.id) return;
+            if (String(p.groupId)!==String(node.groupId)) return;
+            let now=moment().valueOf();
+            node.window.peers[p.from]={open:p.open===true, ts:now, name:p.requestedBy};
+            if (windowOpen(now)!==node.window.eff) evaluate();
         }
 
         // Away: frost protection setpoint on the TRV, the room only asks the boiler for heat below it,
@@ -804,7 +903,7 @@ module.exports = function(RED) {
             let m=node.manual;
             node.manual=null;
             if (!m) return;
-            if (!(node.allowOverride==true && node.executionMode==true && !node.away)) return;
+            if (!(node.allowOverride==true && node.executionMode==true && !paused())) return;
             let now=moment().valueOf();
             nlog(`Manual setpoint ${m.sp}°C taken for ${node.overrideDuration} min`+(groupTopic?`, shared with group ${node.groupId}`:''),"info");
             startOverride(m.sp, now, node.overrideDuration);
@@ -875,7 +974,7 @@ module.exports = function(RED) {
                 return;
             }
             command=String(command);
-            if (!command.match(/^(1|set|on|auto|0|off|trigger|override|away|home)$/i)){
+            if (!command.match(/^(1|set|on|auto|0|off|trigger|override|away|home|window)$/i)){
                 nlog('unhandled msg.payload:'+JSON.stringify(msg.payload),"debug");
                 return;
             }
@@ -889,6 +988,17 @@ module.exports = function(RED) {
                 }
                 if (msg.payload.noOut===true) node.noOut=true;
                 setAway(v,'input');
+                return;
+            }
+
+            if (command=='window'){
+                // window state from a flow (no sensor topic needed): {command:"window", value:true|false}
+                let v=awayValue(msg.payload.value===undefined ? true : msg.payload.value);
+                if (v===undefined){ nlog(`Command:window invalid value ${JSON.stringify(msg.payload.value)}`,"error"); return; }
+                node.window.lastMsgTs=moment().valueOf(); node.window.rawOpen=v;
+                clearTimeout(node.window.timer); node.window.timer=null;
+                if (v===node.window.own){ evaluate(); return; }
+                setWindowOwn(v,'input');
                 return;
             }
 
@@ -970,9 +1080,9 @@ module.exports = function(RED) {
                 node.status({fill:'grey',shape:'dot',text:`Off t:${t}°C, sp:${sp}°C`});
                 return;
             }
-            if (node.away){
+            if (paused()){
                 let deg=node.health.state==='DEGRADED' ? `(${node.health.reasons.join(', ')}) ` : '';
-                node.status({fill:'blue',shape:'dot',text:`${deg}Away t:${t}°C, sp:${sp}°C`});
+                node.status({fill:'blue',shape:'dot',text:`${deg}${node.away?'Away':'Window open'} t:${t}°C, sp:${sp}°C`});
                 return;
             }
             let prefix='';
@@ -1001,7 +1111,16 @@ module.exports = function(RED) {
             checkOverrideExpiry();
             let healthChanged=computeHealth(now);
 
-            if (node.refTemp===undefined || (node.requestSp===undefined && !node.away)){
+            // Window: effective state (own sensor or room), a change pushes the TRV and tells the boiler now.
+            let wopen=windowOpen(now);
+            if (wopen!==node.window.eff){
+                node.window.eff=wopen; node.window.effSince=now;
+                if (wopen) cancelManual('window open');
+                node.inputTrigger=true; node.lastBoilerSendTs=0; healthChanged=true;
+            }
+            publishWindow(false);                                        // refresh for the room while open
+
+            if (node.refTemp===undefined || (node.requestSp===undefined && !paused())){
                 let t=node.refTemp!==undefined ? node.refTemp : "?";
                 let sp=node.requestSp!==undefined ? node.requestSp : "?";
                 node.status({fill:'yellow',shape:'dot',text:`Not ready t:${t}°C, sp:${sp}°C`});
@@ -1012,7 +1131,7 @@ module.exports = function(RED) {
             }
 
             // --- Setpoint towards the TRV ------------------------------------------------------
-            const target = node.away ? node.awaySp : node.requestSp;     // what the TRV should have now
+            const target = paused() ? node.awaySp : node.requestSp;      // what the TRV should have now
             if (node.executionMode==true && !node.manual){                // never fight a knob being turned
                 if (node.firstEval==true && node.inputTrigger==false){
                     // Startup: adopt the saved/known setpoint and make sure the TRV has it.
@@ -1023,7 +1142,7 @@ module.exports = function(RED) {
                     }
                 }
                 else if ((node.inputTrigger==true && !same(node.sp,target)) || node.spUpdateMode=="spUpdateMode.cycle"){
-                    pushSetpointToTrv(target, node.away?'away':(node.inputTrigger?'schedule':'cycle'));
+                    pushSetpointToTrv(target, node.away?'away':(node.window.eff?'window open':(node.inputTrigger?'schedule':'cycle')));
                 }
 
                 if (node.driftPending==true){
@@ -1066,7 +1185,8 @@ module.exports = function(RED) {
 
             // --- Demand towards the boiler ----------------------------------------------------
             // Away: only frost protection, the room asks for heat when it falls below the away setpoint.
-            let boilerSp = (node.executionMode==false || releasesDemand()) ? node.offSp : (node.away ? node.awaySp : node.requestSp);
+            // Window open: same, the room only keeps itself above the frost setpoint.
+            let boilerSp = (node.executionMode==false || releasesDemand()) ? node.offSp : (paused() ? node.awaySp : node.requestSp);
             let heartbeatDue = node.heartbeat>0 && now-node.lastBoilerSendTs>=node.heartbeat*60000;
             if (node.refTemp!=node.prevRefTemp || !same(boilerSp,node.prevSp) || node.firstEval==true || heartbeatDue || healthChanged){
                 if (node.noOut==false){
@@ -1079,7 +1199,8 @@ module.exports = function(RED) {
                         groupId:node.groupId,
                         health:node.health.state,
                         reasons:node.health.reasons,
-                        away:node.away
+                        away:node.away,
+                        window:node.window.eff
                     }}]);
                     node.lastBoilerSendTs=now;
                 }
@@ -1147,6 +1268,10 @@ module.exports = function(RED) {
                     return;
                 }
                 if (obj===null || typeof obj!=='object') return;
+                if (groupWindowTopic && topic===groupWindowTopic){
+                    try{ peerWindow(obj); }catch(e){ node.error("Error processing room window state: "+e.message); }
+                    return;
+                }
                 if (groupTopic && topic===groupTopic){
                     try{ applyGroupOverride(obj,'MQTT'); }catch(e){ node.error("Error processing group manual change: "+e.message); }
                     if (topic!==node.temperatureSensorStateTopic && topic!==node.valveSetpointStateTopic && topic!==node.valveModeStateTopic) return;
@@ -1164,6 +1289,7 @@ module.exports = function(RED) {
 
         node.on('close', function(done) {
             clearTimeout(node.manualTimer);
+            clearTimeout(node.window.timer);
             clearInterval(node.evalInterval);
             clearTimeout(node.startTimeout);
             if (node.mqttclient) {

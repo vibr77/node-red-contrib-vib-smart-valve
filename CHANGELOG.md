@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.85.0 — 2026-11-01
+
+- Window sensor (optional topic, key `contact`, open when `false`): a window open for more than 60 s stops the heating of the
+  room (TRV and boiler at the Away/frost setpoint, `window: true`); closing it restores the schedule at once, a manual override
+  keeps its end time. Shared with the other valves of the group (`smartheating/group/<id>/window`). A sensor silent for 3 h is
+  taken as closed. Home Assistant *Window* binary sensor. Input command `window`.
+
 ## 0.84.0 — 2026-11-01
 
 - Rotary knob: a knob turn is taken once the knob stays still for **Knob settle** seconds (default 20), and at most
