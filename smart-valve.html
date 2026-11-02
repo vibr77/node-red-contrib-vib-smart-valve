@@ -94,6 +94,19 @@
             failedAction:{value:"failedAction.release"},
             trvLocalTempKey:{value:"local_temperature"},
             trvAlarmKey:{value:"valve_alarm"},
+            resetReapply:{value:true},
+            autoCalibrate:{value:true},
+            calibrateMax:{value:"2",validate:function(v){ return v==="" || v===undefined || (!isNaN(v) && Number(v)>=0 && Number(v)<=20); }},
+            calibrateWindow:{value:"24",validate:function(v){ return v==="" || v===undefined || (!isNaN(v) && Number(v)>0 && Number(v)<=720); }},
+            valveCalibrateSetTopic:{value:""},
+            valveCalibratePayload:{value:"calibrate"},
+            leakDelta:{value:"6",validate:function(v){ return v==="" || v===undefined || (!isNaN(v) && Number(v)>=0 && Number(v)<=30); }},
+            leakDuration:{value:"30",validate:function(v){ return v==="" || v===undefined || (!isNaN(v) && Number(v)>=1 && Number(v)<=1440); }},
+            trvSensorKey:{value:"sensor"},
+            trvOutageKey:{value:"power_outage_count"},
+            trvBatteryKey:{value:"battery"},
+            trvCalibratedKey:{value:"calibrated"},
+            trvBodyTempKey:{value:"device_temperature"},
            
         },
 
@@ -136,7 +149,9 @@
             const node = this;
             // 0.82: nodes created with an older version have no value for the new options. Show the
             // default that the runtime applies instead of an empty field.
-            ['awaySp','manualSettle','manualMaxWait','windowKey','windowOpenValue','windowOpenDelay','windowTimeout','maxSp','heartbeat','sensorTimeout','trvTimeout','alarmDuration','frozenDelta','frozenDuration','ackTimeout','failedAction','trvLocalTempKey','trvAlarmKey'].join(',').split(',').forEach(function(k){
+            // 0.87 checkboxes default to on for nodes created before
+            ['resetReapply','autoCalibrate'].forEach(function(k){ if (node[k]===undefined || node[k]==="") $('#node-input-'+k).prop('checked',true); });
+            ['awaySp','manualSettle','manualMaxWait','windowKey','windowOpenValue','windowOpenDelay','windowTimeout','maxSp','heartbeat','sensorTimeout','trvTimeout','alarmDuration','frozenDelta','frozenDuration','ackTimeout','failedAction','trvLocalTempKey','trvAlarmKey','calibrateMax','calibrateWindow','valveCalibratePayload','leakDelta','leakDuration','trvSensorKey','trvOutageKey','trvBatteryKey','trvCalibratedKey','trvBodyTempKey'].join(',').split(',').forEach(function(k){
                 var d = node._def.defaults[k];
                 if (d && (node[k]===undefined || node[k]==="" || node[k]===null)) { $('#node-input-'+k).val(d.value); }
             });
@@ -383,6 +398,73 @@
     <div class="form-row">
         <label for="node-input-trvAlarmKey"><i class="fa fa-key">&nbsp;</i>TRV alarm key</label>
         <input type="text" id="node-input-trvAlarmKey" title="Key of the valve alarm in its state payload" style="width:150px !important; "></input>
+        <span></span>
+    </div>
+
+    <h4>TRV restart and calibration (0.87)</h4>
+    <div class="form-row">
+        <label for="node-input-resetReapply"><i class="fa fa-refresh">&nbsp;</i>Re-apply</label>
+        <input type="checkbox" id="node-input-resetReapply" style="width:auto; vertical-align:top;">
+        <span>after a TRV restart (battery change, power loss, back on its internal sensor), send again sensor mode, room temperature and setpoint; check the sensor mode hourly</span>
+    </div>
+    <div class="form-row">
+        <label for="node-input-autoCalibrate"><i class="fa fa-arrows-v">&nbsp;</i>Auto calibrate</label>
+        <input type="checkbox" id="node-input-autoCalibrate" style="width:auto; vertical-align:top;">
+        <span>after a restart, when the TRV says it is not calibrated, or when the valve does not close (2 min later)</span>
+    </div>
+    <div class="form-row">
+        <label for="node-input-calibrateMax"><i class="fa fa-wrench">&nbsp;</i>At most</label>
+        <input type="text" id="node-input-calibrateMax" title="Automatic calibrations allowed in the window below (0 = none). Calibrations asked from a flow or Home Assistant are not counted." style="width:60px !important; text-align: right;"></input>
+        <span>calibrations</span>
+    </div>
+    <div class="form-row">
+        <label for="node-input-calibrateWindow"><i class="fa fa-wrench">&nbsp;</i>Within</label>
+        <input type="text" id="node-input-calibrateWindow" title="Window for the calibration limit" style="width:60px !important; text-align: right;"></input>
+        <span>hours</span>
+    </div>
+    <div class="form-row">
+        <label for="node-input-valveCalibrateSetTopic"><i class="fa fa-tasks">&nbsp;</i>Calibrate topic</label>
+        <input type="text" id="node-input-valveCalibrateSetTopic" title="Empty: derived from the sensor type topic (…/set/calibrate)" style="width:250px !important; "></input>
+        <span></span>
+    </div>
+    <div class="form-row">
+        <label for="node-input-valveCalibratePayload"><i class="fa fa-tasks">&nbsp;</i>Calibrate payload</label>
+        <input type="text" id="node-input-valveCalibratePayload" title="Payload sent on the calibrate topic" style="width:150px !important; "></input>
+        <span></span>
+    </div>
+    <div class="form-row">
+        <label for="node-input-leakDelta"><i class="fa fa-wrench">&nbsp;</i>Leak gap</label>
+        <input type="text" id="node-input-leakDelta" title="TRV body this much above the room while the valve should be closed: valve not closing (DEGRADED). 0 = off" style="width:60px !important; text-align: right;"></input>
+        <span>°C</span>
+    </div>
+    <div class="form-row">
+        <label for="node-input-leakDuration"><i class="fa fa-wrench">&nbsp;</i>Leak for</label>
+        <input type="text" id="node-input-leakDuration" title="Body hot this long (after 60 min closed) before the warning" style="width:60px !important; text-align: right;"></input>
+        <span>min</span>
+    </div>
+    <div class="form-row">
+        <label for="node-input-trvSensorKey"><i class="fa fa-key">&nbsp;</i>Sensor mode key</label>
+        <input type="text" id="node-input-trvSensorKey" title="Key of the sensor mode (internal/external) in the TRV state payload" style="width:150px !important; "></input>
+        <span></span>
+    </div>
+    <div class="form-row">
+        <label for="node-input-trvOutageKey"><i class="fa fa-key">&nbsp;</i>Outage key</label>
+        <input type="text" id="node-input-trvOutageKey" title="Key of the power outage counter in the TRV state payload" style="width:150px !important; "></input>
+        <span></span>
+    </div>
+    <div class="form-row">
+        <label for="node-input-trvBatteryKey"><i class="fa fa-key">&nbsp;</i>Battery key</label>
+        <input type="text" id="node-input-trvBatteryKey" title="Key of the battery level (%) in the TRV state payload" style="width:150px !important; "></input>
+        <span></span>
+    </div>
+    <div class="form-row">
+        <label for="node-input-trvCalibratedKey"><i class="fa fa-key">&nbsp;</i>Calibrated key</label>
+        <input type="text" id="node-input-trvCalibratedKey" title="Key of the calibrated flag in the TRV state payload" style="width:150px !important; "></input>
+        <span></span>
+    </div>
+    <div class="form-row">
+        <label for="node-input-trvBodyTempKey"><i class="fa fa-key">&nbsp;</i>Body temp key</label>
+        <input type="text" id="node-input-trvBodyTempKey" title="Key of the TRV body (device) temperature in its state payload" style="width:150px !important; "></input>
         <span></span>
     </div>
 
@@ -679,6 +761,20 @@
     <p>With <b>When FAILED</b> = stop asking for heat, a FAILED room sends the off setpoint to the boiler, so a broken TRV or sensor
        cannot keep the boiler running. The valve keeps re-sending its setpoint so it recovers by itself when the device comes back.</p>
     <p><b>Heartbeat</b>: the demand is re-sent to the boiler at least this often, which lets smart-boiler drop valves that went silent.</p>
+    <h3>TRV restart and calibration (0.87)</h3>
+    <p>A TRV that restarts (batteries changed, power lost) forgets part of its settings: an Aqara E1 boots on its <b>internal</b> sensor
+       with its own setpoint. smart-valve sees it from the TRV state (sensor mode different from <i>Sensor type</i>, power outage counter up,
+       battery up by 20 points or more, also across a Node-RED restart) and with <b>Re-apply</b> sends again at once the sensor mode, the room
+       temperature and the setpoint. The setpoint the TRV boots with is never taken as a knob turn. A TRV that stays on the wrong mode is sent it
+       again every 5 min and the room becomes DEGRADED (<code>sensor_mode</code>) after 10 min. The sensor mode is also asked (<code>/get</code>) every hour,
+       since Zigbee2MQTT only publishes changes.</p>
+    <p>With <b>Auto calibrate</b>, the TRV is calibrated 2 min after a restart or a battery change, once when it reports
+       <code>calibrated: false</code> (DEGRADED <code>not_calibrated</code> if it stays so), and once per episode of valve not closing. At most
+       <b>At most</b> automatic calibrations within <b>Within</b> hours (default 2 in 24 h, kept across restarts); beyond, it is skipped and
+       reported. <code>{command:"calibrate"}</code> or the <i>Calibrate TRV</i> button in Home Assistant calibrates at once, outside the limit.</p>
+    <p><b>Valve not closing</b> (<code>valve_not_closing</code>, DEGRADED): the setpoint is at least 1 °C under the room for 60 min, yet the
+       TRV body temperature stays more than <b>Leak gap</b> (default 6 °C) above the room for <b>Leak for</b> minutes (default 30): hot water still
+       goes through the radiator (weak batteries, lost calibration, stuck pin). The demand to the boiler is not changed.</p>
     <h3>Manual change and room sync (0.84)</h3>
     <p>With <b>Manual valve</b> on, a knob turn on the TRV is taken once the knob has stayed still for <b>Knob settle</b> seconds
        (default 20; a rotary knob reports every 0.5 °C step), and at most after <b>Knob max wait</b> (default 60 s) for a knob that keeps moving. While it settles

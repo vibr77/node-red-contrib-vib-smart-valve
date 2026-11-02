@@ -155,7 +155,12 @@ class Trv {
         this.state = Object.assign({
             occupied_heating_setpoint: 20, local_temperature: 20, valve_alarm: false,
             system_mode: 'heat', sensor: 'external', battery: 100, linkquality: 120,
+            calibrated: true, power_outage_count: 0, device_temperature: 20,
         }, opts.state || {});
+        this.internalTemp = opts.internalTemp !== undefined ? opts.internalTemp : 22;   // what its own sensor reads
+        this.refuseSensor = !!opts.refuseSensor;       // a TRV that never takes the sensor mode written to it
+        this.calibrateResult = opts.calibrateResult !== undefined ? opts.calibrateResult : true;
+        this.calibrations = [];
         this.mode = opts.mode || 'healthy';
         this.every = opts.every || 5;            // healthy report period (min)
         this.checkin = opts.checkin || 52;        // stuck check-in period (min)
@@ -163,8 +168,10 @@ class Trv {
         this.ignoreExternal = !!opts.ignoreExternal;   // TRV that stopped using the external temperature
         this.step = opts.step || 0;                     // e.g. 0.5: the TRV rounds setpoints to its step
         this._sub = { connected: true, _emit: (ev, topic, buf) => this._onSet(topic, buf.toString()) };
-        ['occupied_heating_setpoint', 'external_temperature_input', 'sensor', 'system_mode'].forEach(k =>
+        ['occupied_heating_setpoint', 'external_temperature_input', 'sensor', 'system_mode', 'calibrate'].forEach(k =>
             broker.subs.push({ client: this._sub, topic: `${this.topic}/set/${k}` }));
+        broker.subs.push({ client: this._sub, topic: `${this.topic}/get` });
+        this.gets = [];
     }
     start() {
         this.report();
@@ -176,14 +183,39 @@ class Trv {
     report() { if (this.mode !== 'dead') broker.publish(this.topic, JSON.stringify(Object.assign({ last_seen: new Date().toISOString() }, this.state))); }
     // Somebody turns the knob on the device.
     knob(sp) { this.state.occupied_heating_setpoint = sp; if (this.mode === 'healthy') this.report(); }
+    // Batteries replaced (or power lost): an Aqara E1 boots on its internal sensor with its own setpoint.
+    batteryChange(o = {}) {
+        Object.assign(this.state, {
+            sensor: 'internal', battery: o.battery !== undefined ? o.battery : 100,
+            power_outage_count: this.state.power_outage_count + (o.outage === false ? 0 : 1),
+            occupied_heating_setpoint: o.sp !== undefined ? o.sp : 17, local_temperature: this.internalTemp,
+        }, o.calibrated !== undefined ? { calibrated: o.calibrated } : {});
+        this.bootUntil = o.boot ? Date.now() + o.boot * 1000 : 0;
+        this.report();
+    }
     _onSet(topic, payload) {
         const key = topic.split('/').pop();
+        if (key === 'get') { this.gets.push({ t: Date.now(), payload }); if (this.mode === 'healthy') setTimeout(() => this.report(), 1000); return; }
         this.sets.push({ t: Date.now(), key, payload });
         if (this.mode !== 'healthy') return;      // a stuck or dead TRV ignores commands
+        if (Date.now() < (this.bootUntil || 0)) return;   // still booting after a battery change: commands lost
         let v = payload; try { v = JSON.parse(payload); } catch (e) { /* string */ }
+        if (key === 'calibrate') {
+            this.calibrations.push(Date.now());
+            this.state.calibrated = false;
+            setTimeout(() => this.report(), 2000);
+            setTimeout(() => {
+                this.state.calibrated = !!this.calibrateResult;
+                if (this.onCalibrated) this.onCalibrated();
+                this.report();
+            }, 90000);
+            return;
+        }
+        if (key === 'sensor' && this.refuseSensor) { setTimeout(() => this.report(), 2000); return; }
+        if (key === 'external_temperature_input' && this.state.sensor !== 'external') { setTimeout(() => this.report(), 2000); return; }
         if (key === 'occupied_heating_setpoint') this.state.occupied_heating_setpoint = this.step ? Math.round(parseFloat(v) / this.step) * this.step : parseFloat(v);
         if (key === 'external_temperature_input' && !this.ignoreExternal) this.state.local_temperature = parseFloat(v);
-        if (key === 'sensor') this.state.sensor = v;
+        if (key === 'sensor') { this.state.sensor = v; if (v === 'internal') this.state.local_temperature = this.internalTemp; }
         if (key === 'system_mode') this.state.system_mode = v;
         setTimeout(() => this.report(), 2000);     // z2m publishes the new state after the write
     }

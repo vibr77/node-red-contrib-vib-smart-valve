@@ -157,6 +157,41 @@ module.exports = function(RED) {
         this.trvAlarmKey=n.trvAlarmKey ? n.trvAlarmKey : 'valve_alarm';
         this.sensorTypeRefresh=60;                          // re-send "sensor type" to the TRV at most hourly
 
+        // --- 0.87: TRV reset (battery change, power loss) and valve closing ---------------------------
+        this.resetReapply = (n.resetReapply===undefined || n.resetReapply==="") ? true : truthy(n.resetReapply);
+        this.autoCalibrate = (n.autoCalibrate===undefined || n.autoCalibrate==="") ? true : truthy(n.autoCalibrate);
+        this.calibrateMax = opt(n.calibrateMax,2,true);             // automatic calibrations allowed...
+        this.calibrateWindow = opt(n.calibrateWindow,24);           // ...within this many hours
+        if (!(this.calibrateWindow>0)) this.calibrateWindow=24;
+        this.calibrateDelay = 120;                                  // s after the trigger: the TRV has booted and taken its settings
+        this.leakDelta = opt(n.leakDelta,6);                        // °C TRV body above the room while it should be closed (0 = off)
+        this.leakDuration = opt(n.leakDuration,30,true);            // min held -> valve not closing
+        this.leakGrace = 60;                                        // min the valve must have been asked to close (radiator cools down)
+        const key=function(v,d){ return (v===undefined || v===null || String(v).trim()==='') ? d : String(v).trim(); };
+        this.trvSensorKey = key(n.trvSensorKey,'sensor');
+        this.trvOutageKey = key(n.trvOutageKey,'power_outage_count');
+        this.trvBatteryKey = key(n.trvBatteryKey,'battery');
+        this.trvCalibratedKey = key(n.trvCalibratedKey,'calibrated');
+        this.trvBodyTempKey = key(n.trvBodyTempKey,'device_temperature');
+        // Sensor mode the TRV must have: the "Sensor type" payload (a plain value or {"sensor":"external"}).
+        this.expectedSensor = undefined;
+        if (this.valveTemperatureSensorTypeSetTopic && this.valveTemperatureSetTopic && this.valveTemperatureSensorTypePayload!==undefined && String(this.valveTemperatureSensorTypePayload).trim()!==''){
+            let sv=String(this.valveTemperatureSensorTypePayload).trim();
+            try{ let j=JSON.parse(sv); if (j && typeof j==='object' && j[this.trvSensorKey]!==undefined) sv=String(j[this.trvSensorKey]); else if (typeof j!=='object') sv=String(j); }catch(e){ /* plain value */ }
+            this.expectedSensor = sv.toLowerCase();
+        }
+        // Calibrate command: <device>/set/calibrate by default, next to the other /set/<key> topics.
+        this.valveCalibrateSetTopic = undefined;
+        if (n.valveCalibrateSetTopic && String(n.valveCalibrateSetTopic).trim()!=='') this.valveCalibrateSetTopic=String(n.valveCalibrateSetTopic).trim();
+        else {
+            let m=String(this.valveTemperatureSensorTypeSetTopic || this.valveSetpointSetTopic || '').match(/^(.*\/set)\/[^\/]+$/);
+            if (m) this.valveCalibrateSetTopic=m[1]+'/calibrate';
+            else if (this.valveSetpointStateTopic) this.valveCalibrateSetTopic=this.valveSetpointStateTopic+'/set/calibrate';
+        }
+        this.valveCalibratePayload = key(n.valveCalibratePayload,'calibrate');
+        this.trvGetTopic = this.valveSetpointStateTopic ? this.valveSetpointStateTopic+'/get' : undefined;
+        this.trvGetEvery = 60;                                      // min between checks of the TRV sensor mode (/get)
+
         this.startTs=moment().valueOf();
         this.trv={
             lastMsgTs:0,            // last message on the TRV state topic
@@ -167,8 +202,26 @@ module.exports = function(RED) {
             frozenSince:0,
             pendingAck:null,        // {sp, ts}: setpoint pushed, waiting for the TRV to report it
             noAck:false,            // the last push was never confirmed
-            lastPushTs:0
+            lastPushTs:0,
+            // 0.87
+            sensor:undefined,       // sensor mode reported by the TRV (internal/external)
+            sensorBadSince:0,       // TRV on another sensor mode than expected since
+            battery:undefined, outage:undefined, calibrated:undefined,
+            bodyTemp:undefined, bodyTs:0,     // TRV body (device) temperature
+            resetGraceUntil:0,      // right after a reset the setpoint it reports is not a knob turn
+            lastReset:null,         // {ts, why:[...]}
+            lastReapplyTs:0,
+            calTimes:[],            // automatic calibrations sent (ts), for the limit
+            lastCal:null,           // {ts, why, manual}
+            calPending:null,        // {why, at, manual}
+            calTimer:null,
+            calSkipped:null,        // {ts, why}: wanted but the limit was reached (or auto calibrate off)
+            calibratingUntil:0,
+            notCalHandled:false,    // a calibration was already sent while the TRV says "not calibrated"
+            closedSince:0, hotSince:0, leak:false, leakCalAsked:false,
+            lastGetTs:0
         };
+        this.trv.lastGetTs=this.startTs;            // first sensor-mode check one hour after start
         this.driftPending=false;
         this.sensorTypeTs=0;
         this.lastBoilerSendTs=0;
@@ -281,6 +334,11 @@ module.exports = function(RED) {
                 overrideMode: node.overrideMode,
                 overrideStartTs: node.overrideStartTs,
                 overrideLen: node.overrideLen,
+                trvBattery: node.trv.battery,
+                trvOutage: node.trv.outage,
+                calTimes: node.trv.calTimes,
+                lastCal: node.trv.lastCal,
+                lastReset: node.trv.lastReset,
                 timestamp: Date.now()
             };
             node.context().set("valveState", state);
@@ -332,6 +390,12 @@ module.exports = function(RED) {
             // A restored temperature counts as fresh from startup only: if the sensor stays silent
             // the room becomes FAILED after sensorTimeout instead of trusting it forever.
             node.refTempTs = node.refTemp!==undefined ? moment().valueOf() : 0;
+            // 0.87: a battery changed while Node-RED was stopped is still seen; the calibration limit holds across restarts
+            if (savedState.trvBattery!==undefined && savedState.trvBattery!==null) node.trv.battery=parseFloat(savedState.trvBattery);
+            if (savedState.trvOutage!==undefined && savedState.trvOutage!==null) node.trv.outage=parseInt(savedState.trvOutage);
+            if (Array.isArray(savedState.calTimes)) node.trv.calTimes=savedState.calTimes.filter(function(x){ return typeof x==='number'; });
+            if (savedState.lastCal && savedState.lastCal.ts) node.trv.lastCal=savedState.lastCal;
+            if (savedState.lastReset && savedState.lastReset.ts) node.trv.lastReset=savedState.lastReset;
             nlog("Loaded saved state: sp=" + node.sp + ", refTemp=" + node.refTemp, "info");
         }
 
@@ -346,6 +410,31 @@ module.exports = function(RED) {
 
         // Plain-language explanation of the current state, for people (node status, Home Assistant).
         function hhmm(ts){ return ts ? moment(ts).format('HH:mm') : '?'; }
+        // 0.87 texts shared by the status detail and the per-check view
+        function frozenAdvice(){
+            return node.trv.sensorBadSince ? ` The TRV is on its ${node.trv.sensor} sensor: ${node.expectedSensor} is sent again every 5 min.`
+                                           : ' Power-cycle the TRV.';
+        }
+        function calText(now){
+            const c=node.trv;
+            if (c.calPending) return ` Calibration at ${hhmm(c.calPending.at)} (${c.calPending.why}).`;
+            if (c.lastCal && now-c.lastCal.ts<12*3600000) return ` Calibrated at ${hhmm(c.lastCal.ts)} (${c.lastCal.why}).`;
+            return '';
+        }
+        function calSkippedText(now){
+            const k=node.trv.calSkipped;
+            if (!k || now-k.ts>=node.calibrateWindow*3600000) return '';
+            return k.off ? ` Calibration advised at ${hhmm(k.ts)} (${k.why}) but Auto calibrate is off: press Calibrate in Home Assistant.`
+                         : ` Calibration not sent at ${hhmm(k.ts)} (${k.why}): limit of ${node.calibrateMax} in ${node.calibrateWindow} h reached.`;
+        }
+        function leakText(now){
+            const t=v=>v===undefined||v===null?'?':parseFloat(v).toFixed(1)+' °C';
+            let after = node.trv.lastCal && node.trv.lastCal.ts>=node.trv.closedSince && !node.trv.calPending
+                ? ` Still warm after the calibration at ${hhmm(node.trv.lastCal.ts)}.` : calText(now);
+            return `The TRV body reads ${t(node.trv.bodyTemp)} while the room is ${t(node.refTemp)} and the valve should be closed (setpoint ${t(node.sp)}) since ${hhmm(node.trv.closedSince)}: hot water still flows through the radiator.`
+                + after + calSkippedText(now) + ' Check the batteries, then that the valve pin moves freely.';
+        }
+
         function explain(now){
             const min=60000, parts=[];
             const t=v=>v===undefined||v===null?'?':parseFloat(v).toFixed(1)+' °C';
@@ -361,8 +450,11 @@ module.exports = function(RED) {
                 }
                 else if (r==='trv_frozen'){
                     let esc = (now-node.trv.frozenSince<node.frozenDuration*min) ? ` It becomes a failure at ${hhmm(node.trv.frozenSince+node.frozenDuration*min)} if it persists.` : '';
-                    parts.push(`The TRV reads ${t(node.trv.localTemp)} while the room is ${t(node.refTemp)} since ${hhmm(node.trv.frozenSince)}: it no longer follows the room temperature (frozen or lost its external sensor).${esc} Power-cycle the TRV.`);
+                    parts.push(`The TRV reads ${t(node.trv.localTemp)} while the room is ${t(node.refTemp)} since ${hhmm(node.trv.frozenSince)}: it no longer follows the room temperature (frozen or lost its external sensor).${esc}`+frozenAdvice());
                 }
+                else if (r==='sensor_mode') parts.push(`The TRV is on its ${node.trv.sensor} sensor since ${hhmm(node.trv.sensorBadSince)} although ${node.expectedSensor} was sent again at ${hhmm(node.trv.lastReapplyTs)}: it does not take it. Set it in Zigbee2MQTT or Home Assistant.`);
+                else if (r==='not_calibrated') parts.push('The TRV reports it is not calibrated.'+calText(now)+calSkippedText(now)+' Check it is properly mounted, then press Calibrate.');
+                else if (r==='valve_not_closing') parts.push(leakText(now));
                 else if (r==='no_ack' && !node.trv.noAck) parts.push(`Setpoint ${t(node.trv.pendingAck?node.trv.pendingAck.sp:node.requestSp)} was not confirmed by the TRV within ${node.ackTimeout} min; sent again at ${hhmm(node.trv.lastPushTs)}.`);
                 else if (r==='no_ack') parts.push(`Setpoint ${t(node.trv.pendingAck?node.trv.pendingAck.sp:node.requestSp)} sent at ${hhmm(node.trv.lastPushTs)} was not confirmed by the TRV (it reports ${t(node.trv.lastSp)}); retried every ${3*node.ackTimeout} min. Power-cycle or re-pair the TRV.`);
             });
@@ -383,6 +475,11 @@ module.exports = function(RED) {
                 head = node.overrideMode ? `OK, manual setpoint ${t(sp)} until ${hhmm(overrideEnd())}, room ${t(rt)}.`
                      : `OK, following the schedule: ${t(sp)}, room ${t(rt)}${(sp!==undefined&&rt!==undefined&&parseFloat(sp)>parseFloat(rt))?', asking for heat.':', warm enough.'}`;
             }
+            // Informative: a recent TRV restart and what was done about it.
+            let lr=node.trv.lastReset;
+            if (lr && now-lr.ts<30*60000 && !node.health.reasons.some(function(r){ return r==='sensor_mode'||r==='not_calibrated'||r==='valve_not_closing'; })){
+                parts.push(`TRV restarted at ${hhmm(lr.ts)} (${whyText(lr.why)})`+(node.resetReapply?': sensor mode, room temperature and setpoint sent again.':'.')+calText(now)+calSkippedText(now));
+            } else if (!node.health.reasons.some(function(r){ return r==='not_calibrated'||r==='valve_not_closing'; }) && calSkippedText(now)) parts.push(calSkippedText(now).trim());
             if (node.manual) parts.unshift(`Knob turned to ${t(node.manual.sp)}: taken in ${Math.max(0,Math.ceil((node.manual.lastTs+node.manualSettle*1000-now)/1000))} s if it stays there.`);
             return [head].concat(parts).join(' ');
         }
@@ -430,7 +527,7 @@ module.exports = function(RED) {
                 let gap=Math.abs(node.trv.localTemp-node.refTemp).toFixed(1);
                 if (R.includes('trv_frozen')){
                     let failedNow = now-node.trv.frozenSince>=node.frozenDuration*min;
-                    out.tracking=line(failedNow?'failed':'warning',`${failedNow?'Failed':'Warning'}: TRV reads ${t(node.trv.localTemp)}, room ${t(node.refTemp)} (gap ${gap} °C, limit ${node.frozenDelta}) since ${hhmm(node.trv.frozenSince)}.`+(failedNow?'':` Becomes a failure at ${hhmm(node.trv.frozenSince+node.frozenDuration*min)}.`)+' Power-cycle the TRV.');
+                    out.tracking=line(failedNow?'failed':'warning',`${failedNow?'Failed':'Warning'}: TRV reads ${t(node.trv.localTemp)}, room ${t(node.refTemp)} (gap ${gap} °C, limit ${node.frozenDelta}) since ${hhmm(node.trv.frozenSince)}.`+(failedNow?'':` Becomes a failure at ${hhmm(node.trv.frozenSince+node.frozenDuration*min)}.`)+frozenAdvice());
                 } else out.tracking=line('ok',`OK: TRV reads ${t(node.trv.localTemp)}, room ${t(node.refTemp)} (gap ${gap} °C, limit ${node.frozenDelta}).`);
             }
 
@@ -441,6 +538,34 @@ module.exports = function(RED) {
             else if (node.trv.pendingAck) out.setpoint=line('waiting',`Waiting: ${t(node.trv.pendingAck.sp)} sent at ${hhmm(node.trv.pendingAck.ts)}, confirmation expected within ${node.ackTimeout} min.`);
             else if (node.trv.lastSp===undefined) out.setpoint=line('waiting','Waiting: the TRV has not reported its setpoint yet.');
             else out.setpoint=line('ok',`OK: the TRV has ${t(node.trv.lastSp)}`+(node.sp!==undefined && !same(node.sp,node.trv.lastSp)?`, ${t(node.sp)} expected.`:', as requested.'));
+
+            // 0.87: TRV settings (sensor mode, calibration, restarts)
+            const used=calibrationsInWindow(now).length;
+            const quota=` Automatic calibrations: ${used}/${node.calibrateMax} in ${node.calibrateWindow} h.`;
+            const lr=node.trv.lastReset;
+            const restarted = lr && now-lr.ts<24*3600000 ? ` Restarted at ${hhmm(lr.ts)} (${whyText(lr.why)}).` : '';
+            if (!node.expectedSensor && !node.valveCalibrateSetTopic) out.trv_config=line('off','Not checked: no sensor type nor calibrate topic configured.');
+            else if (R.includes('sensor_mode')) out.trv_config=line('warning',`Warning: on its ${node.trv.sensor} sensor since ${hhmm(node.trv.sensorBadSince)}, ${node.expectedSensor} sent again at ${hhmm(node.trv.lastReapplyTs)} without effect.`+quota);
+            else if (R.includes('not_calibrated')) out.trv_config=line('warning','Warning: the TRV reports it is not calibrated.'+calText(now)+calSkippedText(now)+quota);
+            else if (node.trv.calPending) out.trv_config=line('waiting',`Waiting: calibration at ${hhmm(node.trv.calPending.at)} (${node.trv.calPending.why}).`+restarted+quota);
+            else if (now<node.trv.calibratingUntil) out.trv_config=line('waiting',`Waiting: calibrating since ${hhmm(node.trv.lastCal.ts)} (${node.trv.lastCal.why}).`+quota);
+            else if (node.trv.sensorBadSince) out.trv_config=line('waiting',`Waiting: on its ${node.trv.sensor} sensor, ${node.expectedSensor} sent at ${hhmm(node.trv.lastReapplyTs)}.`+restarted);
+            else if (node.trv.sensor===undefined && node.trv.calibrated===undefined) out.trv_config=line('waiting','Waiting: the TRV has not reported its sensor mode or calibration yet.');
+            else {
+                let bits=[];
+                if (node.trv.sensor!==undefined) bits.push(`${node.trv.sensor} sensor`);
+                if (node.trv.calibrated!==undefined) bits.push(node.trv.calibrated?'calibrated':'not calibrated');
+                if (node.trv.battery!==undefined) bits.push(`battery ${node.trv.battery}%`);
+                let lc=node.trv.lastCal && now-node.trv.lastCal.ts<24*3600000 ? ` Last calibration ${hhmm(node.trv.lastCal.ts)} (${node.trv.lastCal.why}).` : '';
+                out.trv_config=line('ok',`OK: ${bits.join(', ')}.`+restarted+lc+calSkippedText(now)+quota);
+            }
+
+            // 0.87: valve closing (TRV body temperature while the valve should be closed)
+            if (!(node.leakDelta>0)) out.valve_closing=line('off','Not checked: Leak gap = 0.');
+            else if (node.trv.bodyTemp===undefined) out.valve_closing=line('waiting',`Waiting: no TRV body temperature (${node.trvBodyTempKey}) received.`);
+            else if (R.includes('valve_not_closing')) out.valve_closing=line('warning','Warning: '+leakText(now));
+            else if (!node.trv.closedSince) out.valve_closing=line('ok',`OK: valve open (setpoint ${t(node.sp)}, room ${t(node.refTemp)}), body ${t(node.trv.bodyTemp)}.`);
+            else out.valve_closing=line('ok',`OK: valve closed since ${hhmm(node.trv.closedSince)}, body ${t(node.trv.bodyTemp)}, room ${t(node.refTemp)} (limit +${node.leakDelta} °C for ${node.leakDuration} min).`);
             return out;
         }
 
@@ -479,6 +604,42 @@ module.exports = function(RED) {
                 node.trv.frozenSince=0;
             }
 
+            // 0.87: TRV still on the wrong sensor mode 10 min after it was sent again (it does not take it).
+            if (node.trv.sensorBadSince && now-node.trv.sensorBadSince>10*min) degraded.push('sensor_mode');
+
+            // 0.87: the TRV says it is not calibrated (outside a calibration run). Calibrated once automatically.
+            if (node.trv.calibrated===false && now>=node.trv.calibratingUntil && !node.trv.calPending){
+                if (!node.trv.notCalHandled) requestCalibration('TRV not calibrated', now, false);
+                if (!node.trv.calPending) degraded.push('not_calibrated');
+            }
+
+            // 0.87: valve not closing. The TRV should be closed (setpoint at least 1 °C under the room, for
+            // leakGrace min so the radiator had time to cool) but its body stays hot: water still flows.
+            let closedNow = node.sp!==undefined && node.refTemp!==undefined &&
+                (node.executionMode==false || parseFloat(node.sp)<=parseFloat(node.refTemp)-1);
+            if (closedNow){ if (!node.trv.closedSince) node.trv.closedSince=now; }
+            else node.trv.closedSince=0;
+            let bodyFresh = node.trv.bodyTemp!==undefined && now-node.trv.bodyTs<=3*60*min;
+            if (node.leakDelta>0 && closedNow && bodyFresh && now-node.trv.closedSince>=node.leakGrace*min){
+                let excess = parseFloat(node.trv.bodyTemp)-parseFloat(node.refTemp);
+                let hot = node.trv.leak ? excess>node.leakDelta-1 : excess>node.leakDelta;       // 1 °C hysteresis
+                if (hot){
+                    if (!node.trv.hotSince) node.trv.hotSince=now;
+                    if (node.trv.leak || now-node.trv.hotSince>=node.leakDuration*min){
+                        if (!node.trv.leak){
+                            node.trv.leak=true;
+                            nlog(`Valve not closing: TRV body ${node.trv.bodyTemp}°C, room ${node.refTemp}°C, setpoint ${node.sp}°C`,"warn");
+                        }
+                        if (!node.trv.leakCalAsked){ node.trv.leakCalAsked=true; requestCalibration('valve not closing', now, false); }
+                        degraded.push('valve_not_closing');
+                    }
+                } else { node.trv.hotSince=0; node.trv.leak=false; node.trv.leakCalAsked=false; }
+            } else if (!closedNow || node.leakDelta<=0){
+                node.trv.hotSince=0; node.trv.leak=false; node.trv.leakCalAsked=false;
+            } else if (node.trv.leak){
+                degraded.push('valve_not_closing');      // body reading too old: keep the last verdict
+            }
+
             if (node.trv.pendingAck && node.ackTimeout>0 && now-node.trv.pendingAck.ts>node.ackTimeout*min){
                 if (!node.trv.pendingAck.retried) node.trv.retryNow=true;     // a lost Zigbee write: send it once more
                 else node.trv.noAck=true;
@@ -514,7 +675,7 @@ module.exports = function(RED) {
                 return;
             }
             let subArray=[];
-            [node.temperatureSensorStateTopic,node.valveSetpointStateTopic,node.valveModeStateTopic,ha.enabled?awaySetTopic:undefined,groupTopic,groupWindowTopic].concat(node.windowTopics).forEach(function(t){
+            [node.temperatureSensorStateTopic,node.valveSetpointStateTopic,node.valveModeStateTopic,ha.enabled?awaySetTopic:undefined,(ha.enabled&&node.valveCalibrateSetTopic)?calibrateCmdTopic:undefined,groupTopic,groupWindowTopic].concat(node.windowTopics).forEach(function(t){
                 if (t && String(t).trim()!="" && !subArray.includes(t)) subArray.push(t);
             });
             try{
@@ -542,6 +703,133 @@ module.exports = function(RED) {
                 nlog(`Setpoint ${sp}°C sent to the TRV (${why})`,"debug");
             }
             node.sp=parseFloat(sp);
+        }
+
+        // ---------------------------------------------------------------------------------------
+        // 0.87: TRV reset (battery change, power loss) and calibration
+        // ---------------------------------------------------------------------------------------
+        const RESET_GRACE = 3*60000;        // after a reset, a setpoint the TRV reports is its own, not a knob turn
+        const CAL_RUN = 5*60000;            // a calibration runs the motor end to end; its reports are ignored meanwhile
+        const WHY = {sensor:'back on its internal sensor', restart:'power loss', battery:'battery changed'};
+        function whyText(w){ return [].concat(w||[]).map(function(r){ return WHY[r]||r; }).join(', '); }
+
+        function calibrationsInWindow(now){
+            return node.trv.calTimes.filter(function(ts){ return now-ts < node.calibrateWindow*3600000; });
+        }
+
+        // Send again what the TRV forgets when it restarts: sensor mode, room temperature, setpoint.
+        function reapplyTrvSettings(why, now){
+            node.trv.lastReapplyTs=now;
+            if (node.valveTemperatureSensorTypeSetTopic){
+                node.mqttstack.push({topic:node.valveTemperatureSensorTypeSetTopic,payload:node.valveTemperatureSensorTypePayload,qos:0,retain:false});
+                node.sensorTypeTs=now;
+            }
+            if (node.valveTemperatureSetTopic && node.refTemp!==undefined){
+                node.mqttstack.push({topic:node.valveTemperatureSetTopic,payload:parseFloat(parseFloat(node.refTemp).toFixed(2)),qos:0,retain:false});
+            }
+            const target = paused() ? node.awaySp : node.requestSp;
+            if (node.executionMode==true && target!==undefined){
+                node.trv.pendingAck=null; node.trv.noAck=false; node.trv.retryNow=false;
+                pushSetpointToTrv(target,'TRV restarted');
+            }
+            nlog(`TRV ${why}: sensor mode, room temperature and setpoint sent again`,"warn");
+            sendMqtt();
+        }
+
+        // why: text for people. manual: asked from a flow or Home Assistant (no limit, not counted).
+        function requestCalibration(why, now, manual){
+            if (!node.valveCalibrateSetTopic) return false;
+            if (node.trv.calPending || now<node.trv.calibratingUntil) return false;
+            if (!manual && !node.autoCalibrate){
+                if (!node.trv.calSkipped || now-node.trv.calSkipped.ts>60000) nlog(`TRV calibration advised (${why}), Auto calibrate is off`,"warn");
+                node.trv.calSkipped={ts:now, why:why, off:true};
+                return false;
+            }
+            if (!manual && calibrationsInWindow(now).length>=node.calibrateMax){
+                nlog(`TRV calibration not sent (${why}): limit of ${node.calibrateMax} in ${node.calibrateWindow} h reached`,"warn");
+                node.trv.calSkipped={ts:now, why:why};
+                saveState();
+                return false;
+            }
+            let delay = manual ? 1000 : node.calibrateDelay*1000;
+            node.trv.calPending={why:why, at:now+delay, manual:!!manual};
+            clearTimeout(node.trv.calTimer);
+            node.trv.calTimer=setTimeout(fireCalibration, delay);
+            nlog(`TRV calibration at ${moment(now+delay).format('HH:mm:ss')} (${why})`,"info");
+            return true;
+        }
+
+        function fireCalibration(){
+            let c=node.trv.calPending;
+            node.trv.calTimer=null; node.trv.calPending=null;
+            if (!c) return;
+            let now=moment().valueOf();
+            if (!c.manual && calibrationsInWindow(now).length>=node.calibrateMax){     // limit reached meanwhile
+                node.trv.calSkipped={ts:now, why:c.why};
+                nlog(`TRV calibration not sent (${c.why}): limit of ${node.calibrateMax} in ${node.calibrateWindow} h reached`,"warn");
+                return;
+            }
+            node.mqttstack.push({topic:node.valveCalibrateSetTopic,payload:node.valveCalibratePayload,qos:0,retain:false});
+            if (!c.manual) node.trv.calTimes=calibrationsInWindow(now).concat([now]);
+            node.trv.lastCal={ts:now, why:c.why, manual:c.manual};
+            node.trv.calibratingUntil=now+CAL_RUN;
+            node.trv.notCalHandled=true;
+            node.trv.calSkipped=null;
+            nlog(`TRV calibration sent (${c.why})`+(c.manual?'':`, ${node.trv.calTimes.length}/${node.calibrateMax} in ${node.calibrateWindow} h`),"warn");
+            computeHealth(now);
+            haState(node.prevSp, true);
+            sendMqtt();
+            saveState();
+        }
+
+        // Reads what a TRV state message says about its configuration. True on a reset or a settings change.
+        function trvHousekeeping(p, now){
+            let reasons=[], changed=false;
+            const before=[node.trv.sensorBadSince>0, node.trv.calibrated, node.trv.sensor].join();
+            if (node.expectedSensor && p[node.trvSensorKey]!==undefined && p[node.trvSensorKey]!==null){
+                let sv=String(p[node.trvSensorKey]).toLowerCase();
+                node.trv.sensor=sv;
+                if (sv!==node.expectedSensor){
+                    if (!node.trv.sensorBadSince){ node.trv.sensorBadSince=now; reasons.push('sensor'); }
+                    else if (node.resetReapply && now-node.trv.lastReapplyTs>=5*60000) reapplyTrvSettings(`still on its ${sv} sensor`, now);
+                } else node.trv.sensorBadSince=0;
+            }
+            let o=parseInt(p[node.trvOutageKey]);
+            if (p[node.trvOutageKey]!==undefined && p[node.trvOutageKey]!==null && !isNaN(o)){
+                if (node.trv.outage!==undefined && o>node.trv.outage) reasons.push('restart');
+                node.trv.outage=o;
+            }
+            let b=parseFloat(p[node.trvBatteryKey]);
+            if (p[node.trvBatteryKey]!==undefined && p[node.trvBatteryKey]!==null && !isNaN(b)){
+                if (node.trv.battery!==undefined && b-node.trv.battery>=20) reasons.push('battery');
+                node.trv.battery=b;
+            }
+            let c=p[node.trvCalibratedKey];
+            if (c!==undefined && c!==null){
+                c = c===true || truthy(c) || String(c).toUpperCase()==='ON';
+                if (c) node.trv.notCalHandled=false;
+                node.trv.calibrated=c;
+            }
+            let bt=parseFloat(p[node.trvBodyTempKey]);
+            if (p[node.trvBodyTempKey]!==undefined && p[node.trvBodyTempKey]!==null && !isNaN(bt)){
+                node.trv.bodyTemp=bt; node.trv.bodyTs=now;
+            }
+            changed = before!==[node.trv.sensorBadSince>0, node.trv.calibrated, node.trv.sensor].join();
+            if (!reasons.length) return changed;
+
+            // A restart or a battery change explains the sensor mode: name the cause only.
+            if (reasons.includes('restart') || reasons.includes('battery')) reasons=['battery','restart'].filter(function(r){ return reasons.includes(r); });
+            let why=whyText(reasons);
+            node.trv.lastReset={ts:now, why:reasons};
+            node.trv.resetGraceUntil=now+RESET_GRACE;
+            node.trv.frozenSince=0;
+            if (node.manual) cancelManual('TRV restarted');
+            nlog(`TRV reset detected (${why})`,"warn");
+            if (node.resetReapply) reapplyTrvSettings(why==WHY.sensor ? WHY.sensor : `restarted (${why})`, now);
+            // A restart or a battery change: the motor must find its end stops again.
+            if (reasons.includes('restart') || reasons.includes('battery')) requestCalibration(why, now, false);
+            saveState();
+            return true;
         }
 
         function callbackMqtt(topic,p){
@@ -594,6 +882,8 @@ module.exports = function(RED) {
                 if (p[node.trvLocalTempKey]!==undefined && p[node.trvLocalTempKey]!==null && !isNaN(p[node.trvLocalTempKey])){
                     node.trv.localTemp=parseFloat(p[node.trvLocalTempKey]);
                 }
+                if (trvHousekeeping(p, now)) flgProcess=true;
+                const inGrace = now < node.trv.resetGraceUntil;
                 if (p[node.trvAlarmKey]!==undefined && p[node.trvAlarmKey]!==null){
                     let a=truthy(p[node.trvAlarmKey]);
                     if (a && !node.trv.alarm) node.trv.alarmSince=now;
@@ -606,6 +896,9 @@ module.exports = function(RED) {
                 if (raw!==undefined && raw!==null && !isNaN(valveSp)){
                     node.trv.lastSp=valveSp;
                     nlog(`[MQTT] receive valve setpoint:${valveSp}`,"debug");
+                    // Just restarted: what it reports is its boot value. It becomes the reference, so the same value
+                    // reported again later (our setpoint still not taken) is never mistaken for a knob turn.
+                    if (inGrace && node.trv.pendingAck && !sameAck(valveSp,node.trv.pendingAck.sp)) node.trv.pendingAck.prev=valveSp;
 
                     let guard = node.expiredOverride && sameAck(valveSp,node.expiredOverride.sp) && now-node.expiredOverride.ts<30*60000;
                     if (node.trv.pendingAck && sameAck(valveSp,node.trv.pendingAck.sp)){
@@ -621,7 +914,7 @@ module.exports = function(RED) {
                         node.requestSp=clampSp(valveSp);
                         flgProcess=true;
                     }
-                    else if ((node.trv.pendingAck || node.trv.noAck) && node.allowOverride==true && node.executionMode==true && !guard && !paused() &&
+                    else if ((node.trv.pendingAck || node.trv.noAck) && node.allowOverride==true && node.executionMode==true && !guard && !paused() && !inGrace &&
                              node.trv.pendingAck && node.trv.pendingAck.prev!==undefined && !sameAck(valveSp,node.trv.pendingAck.prev)){
                         // A value that is neither what we sent nor what the TRV had before: someone turned the knob
                         // while we were waiting. Accept it as a manual change (Manual valve on).
@@ -637,6 +930,12 @@ module.exports = function(RED) {
                         // The value of the override that just expired comes back: a TRV repeating a stale value
                         // (stuck, or its own schedule), not a person. Put the schedule back, do not re-override.
                         nlog(`TRV reports ${valveSp}°C again right after that override expired -> ignored, schedule re-applied`,"warn");
+                        node.driftPending=true; node.driftForce=true;
+                        flgProcess=true;
+                    }
+                    else if (inGrace && node.sp!==undefined && knobMoved(valveSp,node.sp) && node.executionMode==true){
+                        // The TRV just restarted with its own setpoint: not a person, put ours back.
+                        nlog(`TRV reports ${valveSp}°C after its restart -> ${node.sp}°C re-applied`,"info");
                         node.driftPending=true; node.driftForce=true;
                         flgProcess=true;
                     }
@@ -726,6 +1025,7 @@ module.exports = function(RED) {
         const stateTopic = `${ha.base}/valve/${slug(node.name)}/state`;
         const availTopic = `${ha.base}/valve/${slug(node.name)}/availability`;
         const awaySetTopic = `${ha.base}/valve/${slug(node.name)}/away/set`;
+        const calibrateCmdTopic = `${ha.base}/valve/${slug(node.name)}/calibrate/set`;
         // Valves of one room (same group id) share manual changes on this topic, without any flow wiring.
         const hasGroup = node.groupId!==undefined && node.groupId!==null && String(node.groupId).trim()!=='';
         const groupTopic = (node.groupSync && hasGroup) ? `${ha.base}/group/${slug(String(node.groupId))}/manual` : null;
@@ -752,11 +1052,14 @@ module.exports = function(RED) {
                 ['sensor','status',Object.assign({name:'Status detail',unique_id:uid+'_status',icon:'mdi:information-outline',value_template:'{{ value_json.status[:255] }}'},common)]);
             [['sensor','Room sensor check','mdi:thermometer-check'],['trv_link','TRV link check','mdi:access-point-check'],
              ['valve_alarm','Valve alarm check','mdi:valve'],['tracking','TRV tracking check','mdi:chart-line-variant'],
-             ['setpoint','Setpoint confirmation check','mdi:check-network-outline']].forEach(function(c){
+             ['setpoint','Setpoint confirmation check','mdi:check-network-outline'],
+             ['trv_config','TRV settings check','mdi:cog-refresh-outline'],['valve_closing','Valve closing check','mdi:pipe-valve']].forEach(function(c){
                 entities.push(['sensor','check_'+c[0],Object.assign({},common,{name:c[1],unique_id:uid+'_check_'+c[0],icon:c[2],
                     value_template:`{{ value_json.checks.${c[0]}.text[:255] }}`,
                     json_attributes_template:`{{ {'level': value_json.checks.${c[0]}.level} | tojson }}`})]);
             });
+            if (node.valveCalibrateSetTopic) entities.push(['button','calibrate',{name:'Calibrate TRV',unique_id:uid+'_calibrate',icon:'mdi:tune-vertical',
+                command_topic:calibrateCmdTopic,payload_press:'PRESS',availability_topic:availTopic,device:device}]);
             entities.forEach(function(e){
                 node.mqttstack.push({topic:`${ha.prefix}/${e[0]}/${uid}/${e[1]}/config`,payload:e[2],qos:1,retain:true});
             });
@@ -790,6 +1093,19 @@ module.exports = function(RED) {
                 window:node.window.eff,
                 window_since:node.window.eff?new Date(node.window.effSince).toISOString():null,
                 window_source:node.window.eff?(ownWindowOpen(now)?'sensor':'room'):null,
+                trv_sensor:node.trv.sensor!==undefined?node.trv.sensor:null,
+                trv_calibrated:node.trv.calibrated!==undefined?node.trv.calibrated:null,
+                trv_battery:node.trv.battery!==undefined?node.trv.battery:null,
+                trv_body_temperature:node.trv.bodyTemp!==undefined?node.trv.bodyTemp:null,
+                valve_not_closing:node.health.reasons.includes('valve_not_closing'),
+                trv_restarted:node.trv.lastReset?new Date(node.trv.lastReset.ts).toISOString():null,
+                trv_restart_reason:node.trv.lastReset?whyText(node.trv.lastReset.why):null,
+                last_calibration:node.trv.lastCal?new Date(node.trv.lastCal.ts).toISOString():null,
+                last_calibration_reason:node.trv.lastCal?node.trv.lastCal.why:null,
+                calibration_pending:node.trv.calPending?new Date(node.trv.calPending.at).toISOString():null,
+                calibrations_in_window:calibrationsInWindow(now).length,
+                calibration_limit:node.calibrateMax,
+                calibration_skipped:node.trv.calSkipped?new Date(node.trv.calSkipped.ts).toISOString():null,
                 window_sensors:openSensors(now).map(sensorName).concat(peerWindowOpen(now).reduce(function(a,k){ return a.concat(node.window.peers[k].sensors||[]); },[])),
                 group:node.groupId
             };
@@ -999,7 +1315,7 @@ module.exports = function(RED) {
                 return;
             }
             command=String(command);
-            if (!command.match(/^(1|set|on|auto|0|off|trigger|override|away|home|window)$/i)){
+            if (!command.match(/^(1|set|on|auto|0|off|trigger|override|away|home|window|calibrate)$/i)){
                 nlog('unhandled msg.payload:'+JSON.stringify(msg.payload),"debug");
                 return;
             }
@@ -1013,6 +1329,14 @@ module.exports = function(RED) {
                 }
                 if (msg.payload.noOut===true) node.noOut=true;
                 setAway(v,'input');
+                return;
+            }
+
+            if (command=='calibrate'){
+                // {command:"calibrate"}: calibrate the TRV now (not counted in the automatic limit)
+                let now=moment().valueOf();
+                if (!requestCalibration('asked from the flow', now, true)) nlog('Calibration asked from the flow ignored: one is already planned or running, or no calibrate topic',"warn");
+                haState(node.prevSp, true); sendMqtt();
                 return;
             }
 
@@ -1210,6 +1534,13 @@ module.exports = function(RED) {
                 }
             }
 
+            // --- 0.87: ask the TRV its sensor mode now and then (Zigbee2MQTT publishes only on change) ---
+            if (node.resetReapply && node.expectedSensor && node.trvGetTopic && now-node.trv.lastGetTs>=node.trvGetEvery*60000){
+                let q={}; q[node.trvSensorKey]="";
+                node.mqttstack.push({topic:node.trvGetTopic,payload:q,qos:0,retain:false});
+                node.trv.lastGetTs=now;
+            }
+
             // --- Demand towards the boiler ----------------------------------------------------
             // Away: only frost protection, the room asks for heat when it falls below the away setpoint.
             // Window open: same, the room only keeps itself above the frost setpoint.
@@ -1279,6 +1610,14 @@ module.exports = function(RED) {
                 sendMqtt();
             });
             node.mqttclient.on('message', (topic, payload) => {
+                if (ha.enabled && topic===calibrateCmdTopic){
+                    try{
+                        let now=moment().valueOf();
+                        if (!requestCalibration('asked from Home Assistant', now, true)) nlog('Calibration from Home Assistant ignored: one is already planned or running',"warn");
+                        haState(node.prevSp, true); sendMqtt();
+                    }catch(e){ node.error("Error processing calibrate command: "+e.message); }
+                    return;
+                }
                 if (ha.enabled && topic===awaySetTopic){
                     let v=payload.toString(), j;
                     try{ j=JSON.parse(v); }catch(e){ j=v; }
@@ -1316,6 +1655,7 @@ module.exports = function(RED) {
 
         node.on('close', function(done) {
             clearTimeout(node.manualTimer);
+            clearTimeout(node.trv.calTimer);
             Object.keys(node.window.sensors).forEach(function(k){ clearTimeout(node.window.sensors[k].timer); });
             clearInterval(node.evalInterval);
             clearTimeout(node.startTimeout);

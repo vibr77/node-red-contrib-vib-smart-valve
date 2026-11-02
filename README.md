@@ -140,7 +140,7 @@ setpoint. Check that the valve pin moves freely, then recalibrate the TRV."*
 
 **Health states**: `OK`, `DEGRADED` (a problem started, still heating), `FAILED` (see above),
 `UNKNOWN` (just started). The reasons (`sensor_silent`, `trv_silent`, `valve_alarm`, `trv_frozen`,
-`no_ack`, `no_sensor_data`) are shown in the status, sent to the boiler and to Home Assistant.
+`no_ack`, `no_sensor_data`, and DEGRADED-only since 0.87 `sensor_mode`, `not_calibrated`, `valve_not_closing`) are shown in the status, sent to the boiler and to Home Assistant.
 
 ### Debug
 
@@ -228,6 +228,44 @@ Set it from a flow (`{command:"away"}`, `{command:"home"}`) or from the **Away**
 
 To take a valve out of smart-boiler completely (valve removed, room closed), send `remove` to the boiler, see the smart-boiler README.
 
+## TRV restart and calibration (0.87)
+
+A TRV that restarts (batteries changed, power lost) forgets part of its settings: an Aqara E1 boots on its
+**internal** sensor with its own setpoint. Until 0.86 this showed up later as a "frozen" TRV with the wrong advice
+("power-cycle the TRV"), as with TRV_SALON_ESCALIER on 2 Nov 2026.
+
+**Detection**, from the TRV state message: sensor mode different from *Sensor type* (e.g. `internal` instead of
+`external`), power outage counter up, or battery up by 20 points or more. Battery level and counter are saved, so a
+battery changed while Node-RED was stopped is still seen. The sensor mode is also asked (`<TRV>/get`) every hour,
+because Zigbee2MQTT only publishes changes.
+
+**Re-apply** (default on): the sensor mode, the room temperature and the setpoint are sent again at once. For
+3 min, a setpoint the TRV reports is its own boot value, not a knob turn: it is put back, never taken as an override.
+A TRV that keeps the wrong mode is sent it again every 5 min and the room is DEGRADED (`sensor_mode`) after 10 min.
+
+**Auto calibrate** (default on): the TRV is calibrated 2 min after a restart or a battery change (the motor finds its
+end stops again), once when it reports `calibrated: false` outside a calibration (DEGRADED `not_calibrated` if it
+stays so), and once per episode of *valve not closing*.
+
+**Limit**: at most **At most** automatic calibrations within **Within** hours (default **2 in 24 h**), kept across
+restarts. Beyond, the calibration is skipped, logged and shown in the status and in Home Assistant
+(`calibration_skipped`). Settings are always re-applied; only calibration is limited. A calibration asked by hand,
+`{command:"calibrate"}` or the *Calibrate TRV* button in Home Assistant, runs at once and is not counted.
+
+**Valve not closing** (DEGRADED `valve_not_closing`): the setpoint is at least 1 °C under the room for 60 min (time
+for the radiator to cool), yet the TRV body temperature (`device_temperature`) stays more than **Leak gap** (6 °C) above
+the room for **Leak for** (30 min): hot water still goes through the radiator. In external sensor mode the TRV's
+`local_temperature` mirrors the room, so only its body reading shows this. The demand to the boiler is not changed.
+
+| Field | Default |
+|---|---|
+| Re-apply | on |
+| Auto calibrate | on |
+| At most / Within | `2` calibrations / `24` h |
+| Calibrate topic / payload | empty = next to *Sensor type Set* (`…/set/calibrate`) / `calibrate` |
+| Leak gap / Leak for | `6` °C (0 = off) / `30` min |
+| Sensor mode, outage, battery, calibrated, body temp keys | `sensor`, `power_outage_count`, `battery`, `calibrated`, `device_temperature` (Zigbee2MQTT, Aqara E1) |
+
 ## Home Assistant
 
 Tick **HA discovery** in the `smart-valve-settings` node (once for all valves). Each valve appears as a
@@ -241,11 +279,14 @@ device **SmartValve <name>** with:
 | Room temperature | from the room sensor |
 | Status detail | plain-language explanation of the state and what to do (first 255 characters; full text in the `status` attribute) |
 | Away (switch) | on = away. Command topic `smartheating/valve/<name>/away/set`, payload `ON` / `OFF` (retained; the node keeps it in line when away is changed from a flow) |
-| Room sensor check, TRV link check, Valve alarm check, TRV tracking check, Setpoint confirmation check | one line per check, e.g. *"OK: 19.0 °C, reported 4 min ago (limit 120 min)."*; attribute `level` = `ok` / `warning` / `waiting` / `failed` / `off` |
+| Calibrate TRV (button) | calibrates the TRV now (0.87), not counted in the automatic limit |
+| Room sensor check, TRV link check, Valve alarm check, TRV tracking check, Setpoint confirmation check, TRV settings check, Valve closing check | one line per check, e.g. *"OK: 19.0 °C, reported 4 min ago (limit 120 min)."*; attribute `level` = `ok` / `warning` / `waiting` / `failed` / `off` |
 
 All these share the state topic `smartheating/valve/<name>/state`, whose attributes include `reasons`,
 `health_since`, `scheduled_setpoint`, `trv_setpoint`, `trv_temperature`, `trv_age_min`, `sensor_age_min`,
-`valve_alarm`, `override`, `mode`, `away` and `away_setpoint`. The device becomes *unavailable* when Node-RED stops.
+`valve_alarm`, `override`, `mode`, `away` and `away_setpoint`, and since 0.87 `trv_sensor`, `trv_calibrated`,
+`trv_battery`, `trv_body_temperature`, `valve_not_closing`, `trv_restarted`, `trv_restart_reason`, `last_calibration`,
+`last_calibration_reason`, `calibration_pending`, `calibrations_in_window`, `calibration_limit`, `calibration_skipped`. The device becomes *unavailable* when Node-RED stops.
 
 Example alert:
 
@@ -282,11 +323,13 @@ actions:
 - Keep the Safety defaults.
 - Check that *Valve Sensor Internal/External → Set* points to the TRV of the same node.
 - One TRV that keeps reporting `valve_alarm`: remove it, check the pin moves freely, refit and calibrate.
+- Keep *Re-apply* and *Auto calibrate* on; change the batteries of all TRVs of a room together (lithium AA hold their voltage in the cold).
 
 ## State persistence
 
 The node saves its state to `~/.node-red/.node-red-state/valve-{node-id}.json` (and to the node context):
-requested setpoint, setpoint applied to the TRV, scheduled setpoint, room temperature and timestamp. It is
+requested setpoint, setpoint applied to the TRV, scheduled setpoint, room temperature and timestamp, and since 0.87
+the TRV battery level and outage counter, the automatic calibrations of the window and the last restart and calibration. It is
 restored when Node-RED restarts or the flow is redeployed. A restored room temperature only counts as fresh from
 start-up: if the sensor stays silent, the room becomes FAILED after the sensor timeout instead of trusting the old
 value forever.
@@ -298,7 +341,7 @@ npm install
 npm test
 ```
 
-27 tests run the node with a fake clock, an in-memory MQTT broker and simulated Zigbee2MQTT devices (a room
+108 tests run the node with a fake clock, an in-memory MQTT broker and simulated Zigbee2MQTT devices (a room
 sensor and a TRV that can be healthy, stuck or dead), including a replay of a stuck-TRV incident.
 
 ## Changes

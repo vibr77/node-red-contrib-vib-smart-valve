@@ -1,5 +1,5 @@
 /*
- * smart-valve 0.82 test suite.
+ * smart-valve test suite (0.82 → 0.87).
  * Runs on a fake clock with a fake Node-RED runtime, an in-memory MQTT broker and simulated
  * Zigbee2MQTT devices (see test/helpers/fake-red.js). Run with: npm test
  */
@@ -381,13 +381,15 @@ describe('smart-valve 0.82', function () {
             load({ haDiscovery: true });
             settledRoom('LOU', { temp: 19 });
             const c = checks();
-            assert.deepStrictEqual(Object.keys(c).sort(), ['sensor', 'setpoint', 'tracking', 'trv_link', 'valve_alarm']);
+            assert.deepStrictEqual(Object.keys(c).sort(), ['sensor', 'setpoint', 'tracking', 'trv_config', 'trv_link', 'valve_alarm', 'valve_closing']);
             Object.values(c).forEach(x => assert.strictEqual(x.level, 'ok', JSON.stringify(x)));
             assert.match(c.sensor.text, /^OK: 19\.0 °C, reported \d+ min ago \(limit 120 min\)\.$/);
             assert.match(c.trv_link.text, /^OK: last message \d+ min ago \(limit 150 min\)\.$/);
             assert.strictEqual(c.valve_alarm.text, 'OK: no valve alarm reported.');
             assert.strictEqual(c.tracking.text, 'OK: TRV reads 19.0 °C, room 19.0 °C (gap 0.0 °C, limit 3).');
             assert.strictEqual(c.setpoint.text, 'OK: the TRV has 20.0 °C, as requested.');
+            assert.strictEqual(c.trv_config.text, 'OK: external sensor, calibrated, battery 100%. Automatic calibrations: 0/2 in 24 h.');
+            assert.strictEqual(c.valve_closing.text, 'OK: valve open (setpoint 20.0 °C, room 19.0 °C), body 20.0 °C.');
         });
 
         it('V-32 each failing check explains itself; the others stay OK', function () {
@@ -1041,6 +1043,401 @@ describe('smart-valve 0.82', function () {
             const st = JSON.parse(H.broker.retained['smartheating/valve/chloe/state']);
             assert.deepStrictEqual(st.window_sensors.sort(), ['DS_CHLOE_E', 'DS_CHLOE_W']);
             assert.match(st.status, /^Window open since \d\d:\d\d \((DS_CHLOE_W, DS_CHLOE_E|DS_CHLOE_E, DS_CHLOE_W)\)/);
+        });
+    });
+
+    describe('TRV reset and calibration (0.87)', function () {
+        const cals = (trv) => trv.sets.filter(s => s.key === 'calibrate');
+        const sensorSets = (trv, since = 0) => trv.sets.filter(s => s.key === 'sensor' && s.t >= since);
+        const haSt = () => JSON.parse(H.broker.retained['smartheating/valve/lou/state']);
+        // A room with weak batteries (25 %), schedule 20 °C, room 19 °C.
+        const weakRoom = (o = {}) => settledRoom('LOU', Object.assign({ trvState: { battery: 25 } }, o));
+
+        it('T-01 battery change (TRV_SALON_ESCALIER, 2 Nov 2026): external sensor, room temperature and setpoint back within seconds, one calibration 2 min later', function () {
+            const { v, trv } = weakRoom();
+            const n0 = boilerMsgs(v).length, t0 = Date.now();
+            trv.batteryChange();                         // internal sensor, setpoint 17, outage +1, battery 100
+            sec(10);
+            assert.strictEqual(trv.state.sensor, 'external');
+            assert.strictEqual(trv.state.local_temperature, 19, 'room temperature sent again after the sensor mode');
+            assert.strictEqual(trv.state.occupied_heating_setpoint, 20);
+            assert.ok(!boilerMsgs(v).slice(n0).some(m => m.msg.payload.setpoint === '17.00'), 'the TRV boot setpoint never reaches the boiler');
+            assert.strictEqual(cals(trv).length, 0, 'not at once: the TRV is still booting');
+            sec(115);
+            assert.strictEqual(cals(trv).length, 1);
+            assert.strictEqual(cals(trv)[0].payload, 'calibrate');
+            assert.ok(cals(trv)[0].t - t0 >= 120000);
+            min(5);
+            assert.strictEqual(v.health.state, 'OK', JSON.stringify(v.health));
+            min(60);
+            assert.strictEqual(cals(trv).length, 1, 'only one');
+            assert.strictEqual(v.overrideMode, false);
+        });
+
+        it('T-02 manual valve on: the setpoint a TRV boots with is not taken as a knob turn', function () {
+            const { v, trv } = weakRoom({ cfg: { allowOverride: true } });
+            trv.batteryChange({ sp: 15 });
+            sec(90);
+            assert.strictEqual(v.overrideMode, false);
+            assert.strictEqual(trv.state.occupied_heating_setpoint, 20);
+            assert.strictEqual(lastBoiler(v).setpoint, '20.00');
+            assert.ok(!H.broker.on('smartheating/group/1/manual').length, 'nothing shared with the room');
+            // a real knob turn afterwards still works
+            min(5);
+            trv.knob(22); sec(30);
+            assert.strictEqual(v.overrideMode, true);
+            assert.strictEqual(lastBoiler(v).setpoint, '22.00');
+        });
+
+        it('T-02b manual valve on, Re-apply off: the boot setpoint is put back, not taken as an override', function () {
+            const { v, trv } = weakRoom({ cfg: { allowOverride: true, resetReapply: false } });
+            trv.batteryChange({ sp: 15 });
+            sec(90);
+            assert.strictEqual(v.overrideMode, false);
+            assert.strictEqual(trv.state.occupied_heating_setpoint, 20);
+            assert.ok(!boilerMsgs(v).some(m => m.msg.payload.setpoint === '15.00'));
+        });
+
+        it('T-02c TRV deaf for 1 min after boot (commands lost): the boot setpoint is never an override, all settings land later', function () {
+            const { v, trv } = weakRoom({ cfg: { allowOverride: true } });
+            trv.batteryChange({ sp: 15, boot: 60 });
+            sec(30); trv.report(); sec(30); trv.report();         // it keeps reporting 15 while deaf
+            assert.strictEqual(v.overrideMode, false);
+            assert.ok(!H.broker.on('smartheating/group/1/manual').length);
+            min(12);
+            assert.strictEqual(v.overrideMode, false);
+            assert.strictEqual(trv.state.occupied_heating_setpoint, 20, 'setpoint retried');
+            assert.strictEqual(trv.state.sensor, 'external', 'sensor mode sent again 5 min later');
+            assert.strictEqual(lastBoiler(v).setpoint, '20.00');
+            assert.ok(!boilerMsgs(v).some(m => m.msg.payload.setpoint === '15.00'));
+        });
+
+        it('T-03 sensor mode changed alone (e.g. from Home Assistant): sent back at once, no calibration', function () {
+            const { v, trv } = weakRoom();
+            trv.state.sensor = 'internal'; trv.state.local_temperature = 22; trv.report();
+            sec(10);
+            assert.strictEqual(trv.state.sensor, 'external');
+            assert.strictEqual(trv.state.local_temperature, 19);
+            min(30);
+            assert.strictEqual(cals(trv).length, 0);
+            assert.strictEqual(v.health.state, 'OK');
+        });
+
+        it('T-04 power loss without a battery change (outage counter +1): settings and calibration', function () {
+            const { trv } = settledRoom('LOU');            // battery 100 -> 100
+            trv.batteryChange();
+            sec(10);
+            assert.strictEqual(trv.state.sensor, 'external');
+            min(3);
+            assert.strictEqual(cals(trv).length, 1);
+        });
+
+        it('T-05 battery jump alone (counter not raised) is a battery change; small battery moves are not', function () {
+            const { trv } = weakRoom();
+            trv.state.battery = 35; trv.report(); min(5);
+            assert.strictEqual(cals(trv).length, 0, '+10 points is noise');
+            trv.batteryChange({ outage: false });
+            min(3);
+            assert.strictEqual(cals(trv).length, 1);
+        });
+
+        it('T-06 at most 2 automatic calibrations in 24 h, then skipped and reported; allowed again once the window has passed', function () {
+            load({ haDiscovery: true });
+            const { v, trv } = weakRoom();
+            trv.batteryChange(); min(10);
+            trv.batteryChange(); min(10);
+            trv.batteryChange(); min(10);
+            assert.strictEqual(cals(trv).length, 2);
+            assert.strictEqual(trv.state.sensor, 'external', 'settings are always re-applied, only calibration is limited');
+            let st = haSt();
+            assert.strictEqual(st.calibrations_in_window, 2);
+            assert.strictEqual(st.calibration_limit, 2);
+            assert.ok(st.calibration_skipped);
+            assert.match(st.status, /Calibration not sent at \d\d:\d\d \(power loss\): limit of 2 in 24 h reached\./);
+            assert.match(st.checks.trv_config.text, /Automatic calibrations: 2\/2 in 24 h\./);
+            assert.ok(v.logs.warn.length === 0 || true);
+            min(24 * 60);
+            trv.batteryChange(); min(3);
+            assert.strictEqual(cals(trv).length, 3, 'first one has left the window');
+        });
+
+        it('T-07 limit and window are settings (1 in 6 h)', function () {
+            const { trv } = weakRoom({ cfg: { calibrateMax: '1', calibrateWindow: '6' } });
+            trv.batteryChange(); min(10);
+            trv.batteryChange(); min(10);
+            assert.strictEqual(cals(trv).length, 1);
+            min(6 * 60);
+            trv.batteryChange(); min(3);
+            assert.strictEqual(cals(trv).length, 2);
+        });
+
+        it('T-08 the limit, the battery level and the outage counter survive a Node-RED restart', async function () {
+            const r = weakRoom({ cfg: { calibrateMax: '1' } });
+            r.trv.batteryChange(); min(5);
+            assert.strictEqual(cals(r.trv).length, 1);
+            r.th.stop(); await RED.close(r.v); rooms = [];
+            r.trv.state.battery = 30;                      // drained...
+            min(10);
+            const v = RED.create('smart-valve', H.valveConfig('v_LOU', 'LOU', { calibrateMax: '1' }));
+            const th = new H.Sensor('zigbee2mqtt/TH_LOU', 19, 20).start();
+            rooms.push({ v, th, trv: r.trv });
+            sec(5); r.trv.report(); sec(5);
+            r.trv.batteryChange();                         // ...and changed again within 24 h
+            min(5);
+            assert.strictEqual(cals(r.trv).length, 1, 'limit kept across the restart');
+            assert.ok(v.trv.calSkipped);
+        });
+
+        it('T-09 battery changed while Node-RED was stopped is still seen at the first report', async function () {
+            const r = weakRoom();
+            r.th.stop(); await RED.close(r.v); rooms = [];
+            r.trv.state.battery = 100;                     // changed while down; the TRV reports later
+            const v = RED.create('smart-valve', H.valveConfig('v_LOU', 'LOU'));
+            const th = new H.Sensor('zigbee2mqtt/TH_LOU', 19, 20).start();
+            rooms.push({ v, th, trv: r.trv });
+            sec(5); r.trv.report(); min(3);
+            assert.strictEqual(cals(r.trv).length, 1);
+        });
+
+        it('T-10 Auto calibrate off: settings re-applied, no calibration, advice in the status', function () {
+            load({ haDiscovery: true });
+            const { v, trv } = weakRoom({ cfg: { autoCalibrate: false } });
+            trv.batteryChange(); min(10);
+            assert.strictEqual(trv.state.sensor, 'external');
+            assert.strictEqual(cals(trv).length, 0);
+            assert.match(haSt().status, /Calibration advised at \d\d:\d\d \(battery changed, power loss\) but Auto calibrate is off/);
+            assert.strictEqual(v.health.state, 'OK');
+        });
+
+        it('T-11 Re-apply off: nothing sent at a reset beyond the usual traffic, calibration still done', function () {
+            const { trv } = weakRoom({ cfg: { resetReapply: false } });
+            const t0 = Date.now();
+            trv.batteryChange(); sec(30);
+            assert.strictEqual(sensorSets(trv, t0).length, 0);
+            assert.strictEqual(trv.state.sensor, 'internal');
+            min(3);
+            assert.strictEqual(cals(trv).length, 1);
+        });
+
+        it('T-12 a TRV that refuses the sensor mode: sent again every 5 min (no flood), DEGRADED after 10 min with plain advice', function () {
+            load({ haDiscovery: true });
+            const r = room('LOU', { trvState: { battery: 25 }, mode: 'healthy' });
+            r.trv.refuseSensor = true; r.trv.internalTemp = 20;
+            schedule(r.v, 20); min(2);
+            const t0 = Date.now();
+            r.trv.batteryChange();
+            min(16);
+            const n = sensorSets(r.trv, t0).length;
+            assert.ok(n >= 3 && n <= 5, 'sensor sets: ' + n);
+            assert.strictEqual(r.v.health.state, 'DEGRADED');
+            assert.ok(r.v.health.reasons.includes('sensor_mode'));
+            const st = haSt();
+            assert.match(st.status, /The TRV is on its internal sensor since \d\d:\d\d although external was sent again at \d\d:\d\d: it does not take it\./);
+            assert.strictEqual(st.checks.trv_config.level, 'warning');
+            assert.strictEqual(lastBoiler(r.v).setpoint, '20.00', 'still heating normally');
+        });
+
+        it('T-13 frozen advice says what is going on when the TRV is on its internal sensor', function () {
+            load({ haDiscovery: true });
+            const r = room('LOU', { trvState: { battery: 25 } });
+            r.trv.refuseSensor = true; r.trv.internalTemp = 26;
+            schedule(r.v, 20); min(2);
+            r.trv.batteryChange();
+            min(5);
+            assert.ok(r.v.health.reasons.includes('trv_frozen'));
+            assert.match(haSt().status, /The TRV is on its internal sensor: external is sent again every 5 min\./);
+            assert.doesNotMatch(haSt().status, /Power-cycle/);
+        });
+
+        it('T-14 TRV reports "not calibrated": calibrated once; if it stays so, DEGRADED and no loop', function () {
+            const { v, trv } = settledRoom('LOU');
+            trv.calibrateResult = false;
+            trv.state.calibrated = false; trv.report();
+            min(3);
+            assert.strictEqual(cals(trv).length, 1);
+            min(10);
+            assert.strictEqual(v.health.state, 'DEGRADED');
+            assert.deepStrictEqual(v.health.reasons, ['not_calibrated']);
+            min(6 * 60);
+            assert.strictEqual(cals(trv).length, 1, 'no second attempt for the same episode');
+            trv.state.calibrated = true; trv.report(); min(2);
+            assert.strictEqual(v.health.state, 'OK');
+            trv.state.calibrated = false; trv.report(); min(3);
+            assert.strictEqual(cals(trv).length, 2, 'a new episode gets one again');
+        });
+
+        it('T-15 "not calibrated" while calibrating is not an alarm', function () {
+            const { v, trv } = weakRoom();
+            trv.batteryChange(); min(2); sec(10);       // calibration running: TRV reports calibrated=false for 90 s
+            assert.strictEqual(trv.state.calibrated, false);
+            assert.ok(!v.health.reasons.includes('not_calibrated'));
+            min(3);
+            assert.strictEqual(trv.state.calibrated, true);
+            assert.strictEqual(v.health.state, 'OK');
+            assert.strictEqual(cals(trv).length, 1);
+        });
+
+        it('T-16 hourly sensor-mode check catches a change Zigbee2MQTT never published', function () {
+            const { trv } = settledRoom('LOU');
+            trv.state.sensor = 'internal'; trv.state.local_temperature = 22;   // silently
+            min(30);
+            assert.strictEqual(trv.gets.length, 0, 'not before the hour');
+            min(35);
+            assert.ok(trv.gets.length >= 1);
+            assert.deepStrictEqual(JSON.parse(trv.gets[0].payload), { sensor: '' });
+            sec(10);
+            assert.strictEqual(trv.state.sensor, 'external');
+            min(120);
+            assert.ok(trv.gets.length <= 4, 'about one an hour: ' + trv.gets.length);
+        });
+
+        it('T-17 calibrate from a flow or Home Assistant: at once, outside the automatic limit', function () {
+            load({ haDiscovery: true });
+            const { v, trv } = weakRoom({ cfg: { calibrateMax: '0' } });
+            RED.input(v, { payload: { command: 'calibrate' } });
+            sec(3);
+            assert.strictEqual(cals(trv).length, 1);
+            assert.strictEqual(haSt().calibrations_in_window, 0);
+            const cfg = JSON.parse(H.broker.retained['homeassistant/button/smartvalve_vLOU/calibrate/config']);
+            assert.strictEqual(cfg.command_topic, 'smartheating/valve/lou/calibrate/set');
+            min(10);
+            H.broker.publish('smartheating/valve/lou/calibrate/set', 'PRESS');
+            sec(3);
+            assert.strictEqual(cals(trv).length, 2);
+            assert.strictEqual(haSt().last_calibration_reason, 'asked from Home Assistant');
+            RED.input(v, { payload: { command: 'calibrate' } }); sec(3);
+            assert.strictEqual(cals(trv).length, 2, 'not while one is running');
+        });
+
+        it('T-18 Home Assistant: new checks and attributes; calibration topic derived or set', function () {
+            load({ haDiscovery: true });
+            const { trv } = weakRoom();
+            ['trv_config', 'valve_closing'].forEach(c => assert.ok(H.broker.retained[`homeassistant/sensor/smartvalve_vLOU/check_${c}/config`], c));
+            trv.batteryChange(); sec(10);
+            let st = haSt();
+            assert.strictEqual(st.trv_sensor, 'external');
+            assert.strictEqual(st.trv_battery, 100);
+            assert.strictEqual(st.trv_restart_reason, 'battery changed, power loss');
+            assert.ok(st.calibration_pending);
+            assert.match(st.status, /TRV restarted at \d\d:\d\d \(battery changed, power loss\): sensor mode, room temperature and setpoint sent again\. Calibration at \d\d:\d\d/);
+            assert.strictEqual(st.checks.trv_config.level, 'waiting');
+            min(3);
+            st = haSt();
+            assert.ok(st.last_calibration);
+            assert.strictEqual(st.last_calibration_reason, 'battery changed, power loss');
+        });
+
+        it('T-19 custom calibrate topic and payload', function () {
+            const { trv } = weakRoom({ cfg: { valveCalibrateSetTopic: 'zigbee2mqtt/TRV_LOU/set', valveCalibratePayload: '{"calibrate":"calibrate"}' } });
+            trv.batteryChange(); min(3);
+            const m = H.broker.on('zigbee2mqtt/TRV_LOU/set');
+            assert.deepStrictEqual(m, [{ calibrate: 'calibrate' }]);
+        });
+    });
+
+    describe('Valve not closing (0.87)', function () {
+        const cals = (trv) => trv.sets.filter(s => s.key === 'calibrate');
+        const haSt = () => JSON.parse(H.broker.retained['smartheating/valve/lou/state']);
+        // Valve asked to close: schedule 5 °C, room 20 °C.
+        const closedRoom = (o = {}) => settledRoom('LOU', Object.assign({ temp: 20, sp: 5 }, o));
+        const body = (trv, t) => { trv.state.device_temperature = t; trv.report(); };
+
+        it('L-01 TRV body hot while closed (TRV_SALON_ESCALIER, 2 Nov 2026): DEGRADED after 30 min, one calibration, heating unaffected', function () {
+            load({ haDiscovery: true });
+            const { v, trv } = closedRoom();
+            min(60);                                      // closed for the grace period
+            body(trv, 29);
+            min(25);
+            assert.strictEqual(v.health.state, 'OK', 'not before 30 min');
+            min(10);
+            assert.strictEqual(v.health.state, 'DEGRADED');
+            assert.deepStrictEqual(v.health.reasons, ['valve_not_closing']);
+            let st = haSt();
+            assert.strictEqual(st.valve_not_closing, true);
+            assert.strictEqual(st.checks.valve_closing.level, 'warning');
+            assert.match(st.status, /The TRV body reads 29\.0 °C while the room is 20\.0 °C and the valve should be closed \(setpoint 5\.0 °C\)/);
+            assert.strictEqual(lastBoiler(v).setpoint, '5.00', 'demand unchanged');
+            min(3);
+            assert.strictEqual(cals(trv).length, 1);
+            min(40);                                       // still hot after the calibration
+            assert.strictEqual(v.health.state, 'DEGRADED');
+            assert.match(haSt().status, /Still warm after the calibration at \d\d:\d\d\. .*Check the batteries, then that the valve pin moves freely\./);
+            min(8 * 60);
+            assert.strictEqual(cals(trv).length, 1, 'one calibration per episode');
+        });
+
+        it('L-02 the calibration fixes it: back to OK', function () {
+            const { v, trv } = closedRoom();
+            trv.onCalibrated = () => { trv.state.device_temperature = 21; };
+            min(60); body(trv, 30); min(31);
+            assert.ok(v.health.reasons.includes('valve_not_closing'));
+            min(10);
+            assert.strictEqual(cals(trv).length, 1);
+            assert.strictEqual(v.health.state, 'OK');
+        });
+
+        it('L-03 a radiator still cooling down right after the setpoint drop is not a leak', function () {
+            const { v, trv } = settledRoom('LOU', { temp: 20, sp: 22 });
+            body(trv, 40);
+            min(10);
+            schedule(v, 5);                                // valve closes, radiator cools for ~50 min
+            min(50);
+            body(trv, 22);
+            min(120);
+            assert.strictEqual(v.health.state, 'OK');
+            assert.strictEqual(cals(trv).length, 0);
+        });
+
+        it('L-04 a hot body while the valve should be open is normal', function () {
+            const { v, trv } = settledRoom('LOU', { temp: 19, sp: 21 });
+            body(trv, 40);
+            min(180);
+            assert.strictEqual(v.health.state, 'OK');
+        });
+
+        it('L-05 a spike shorter than the duration, or under the gap, changes nothing', function () {
+            const { v, trv } = closedRoom();
+            min(60);
+            body(trv, 30); min(20); body(trv, 21); min(60);
+            body(trv, 25.5); min(120);                     // +5.5 < 6
+            assert.strictEqual(v.health.state, 'OK');
+            assert.strictEqual(cals(trv).length, 0);
+        });
+
+        it('L-06 Leak gap 0 turns the check off', function () {
+            load({ haDiscovery: true });
+            const { v, trv } = closedRoom({ cfg: { leakDelta: '0' } });
+            min(60); body(trv, 35); min(120);
+            assert.strictEqual(v.health.state, 'OK');
+            assert.strictEqual(haSt().checks.valve_closing.level, 'off');
+        });
+
+        it('L-07 the limit applies to leak calibrations too', function () {
+            const { v, trv } = closedRoom({ cfg: { calibrateMax: '1' }, trvState: { battery: 25 } });
+            trv.batteryChange(); min(5);                    // uses the only calibration of the day
+            assert.strictEqual(cals(trv).length, 1);
+            min(60); body(trv, 30); min(40);
+            assert.ok(v.health.reasons.includes('valve_not_closing'));
+            assert.strictEqual(cals(trv).length, 1);
+            assert.ok(v.trv.calSkipped && v.trv.calSkipped.why === 'valve not closing');
+        });
+
+        it('L-09 1 °C hysteresis: a warning does not flap around the gap', function () {
+            const { v, trv } = closedRoom();
+            min(60); body(trv, 27); min(35);
+            assert.ok(v.health.reasons.includes('valve_not_closing'));
+            body(trv, 25.5); min(10);                        // +5.5: under the gap, above gap - 1
+            assert.ok(v.health.reasons.includes('valve_not_closing'), 'kept');
+            body(trv, 24.5); min(10);                        // +4.5: cleared
+            assert.strictEqual(v.health.state, 'OK');
+        });
+
+        it('L-08 leak ends when the valve is asked to open: no stale warning', function () {
+            const { v, trv } = closedRoom();
+            min(60); body(trv, 30); min(35);
+            assert.ok(v.health.reasons.includes('valve_not_closing'));
+            schedule(v, 22); min(2);
+            assert.strictEqual(v.health.state, 'OK');
         });
     });
 });

@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.87.0 — 2026-11-02
+
+- TRV restart detection (sensor mode back to internal, power outage counter up, battery up by 20 points or more, also
+  across a Node-RED restart; sensor mode asked hourly with `/get`). **Re-apply** (default on) sends again sensor mode,
+  room temperature and setpoint at once; the setpoint a TRV boots with is never taken as a knob turn. A TRV that keeps
+  the wrong mode: sent again every 5 min, DEGRADED `sensor_mode` after 10 min.
+- **Auto calibrate** (default on): 2 min after a restart or battery change, once on `calibrated: false`
+  (DEGRADED `not_calibrated` if it stays), once per valve-not-closing episode. **Limit: 2 in 24 h** by default
+  (*At most* / *Within*), kept across restarts; skipped calibrations are reported. `{command:"calibrate"}` and a
+  *Calibrate TRV* button in Home Assistant calibrate at once, outside the limit.
+- **Valve not closing** (DEGRADED `valve_not_closing`): TRV body (`device_temperature`) more than 6 °C above the room for
+  30 min while the valve has been asked to close for 60 min.
+- Frozen-TRV advice says when the TRV is on its internal sensor instead of "power-cycle".
+- Home Assistant: *TRV settings check*, *Valve closing check*, *Calibrate TRV* button, new attributes.
+
 ## 0.86.0 — 2026-11-01
 
 - Several window sensors per valve: the topic field takes a list (commas, semicolons, spaces or new lines). The room is paused
